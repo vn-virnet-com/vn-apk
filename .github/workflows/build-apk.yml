@@ -657,7 +657,7 @@ jobs:
                   b.addView(button("Y\u00fckle", true, v -> installApk(apk)), lp(MP, dp(50), 22));
               }
 
-              private void setProgress(int pct) {
+              private void updateProgressUi(int pct) {
                   if (updPct == null || updFillV == null || updRestV == null) return;
                   updPct.setText("%" + pct);
                   ((LinearLayout.LayoutParams) updFillV.getLayoutParams()).weight = pct;
@@ -726,7 +726,7 @@ jobs:
                                   final int pct = (int) (done * 100 / total);
                                   if (pct != lastPct) {
                                       lastPct = pct;
-                                      runOnUiThread(() -> setProgress(pct));
+                                      runOnUiThread(() -> updateProgressUi(pct));
                                   }
                               }
                           }
