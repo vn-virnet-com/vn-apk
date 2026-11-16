@@ -333,6 +333,7 @@ jobs:
 
                   WebSettings s = webView.getSettings();
                   s.setJavaScriptEnabled(true);
+                  s.setUserAgentString(s.getUserAgentString() + " VNApp/1");
                   s.setDomStorageEnabled(true);
                   s.setDatabaseEnabled(true);
                   s.setMediaPlaybackRequiresUserGesture(false);
@@ -437,6 +438,10 @@ jobs:
                               } catch (Exception ignored) { }
                           });
                       }
+
+                                // Site, uygulamadan acildigini bu bilgiyle dogrular
+                                @JavascriptInterface
+                                public boolean isApp() { return true; }
 
                                 // Siteden gelen sarki bilgisi -> bildirim paneli (kapak, sure, ileri/geri)
                                 @JavascriptInterface
