@@ -274,6 +274,17 @@ jobs:
               private static final int STORAGE_REQ = 5;
 
               static WeakReference<MainActivity> inst;
+              static volatile boolean bg = false;
+              private boolean wasPlaying = false;
+              private long lastResume = 0;
+              private int resumeTries = 0;
+
+              // Servis, arka plandayken WebView'i uyanik tutar
+              static void poke() {
+                  final MainActivity m = inst == null ? null : inst.get();
+                  if (m == null || m.webView == null) return;
+                  m.runOnUiThread(() -> { m.webView.onResume(); m.webView.resumeTimers(); });
+              }
               private SharedPreferences prefs;
               private FrameLayout root;
               private LinearLayout offline;
@@ -332,7 +343,7 @@ jobs:
                   try {
                       if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                           Set<String> origins = new HashSet<>(Arrays.asList(
-                                  "https://www.youtube.com", "https://www.youtube-nocookie.com"));
+                                  "https://www.youtube.com", "https://youtube.com", "https://*.youtube.com", "https://www.youtube-nocookie.com"));
                           WebViewCompat.addDocumentStartJavaScript(webView, KEEP_JS, origins);
                       }
                   } catch (Throwable ignored) { }
@@ -432,6 +443,15 @@ jobs:
                                 public void media(String title, String artist, String cover, double cur, double dur,
                                                   boolean playing, boolean hasPrev, boolean hasNext) {
                                     if (playing) ensureNotifPerm();
+                                    // Arka plandayken sarki kendiliginden durduysa (kullanici bildirimden durdurmadiysa) yeniden baslat
+                                    if (playing) { wasPlaying = true; resumeTries = 0; }
+                                    else if (title == null || title.isEmpty() || !bg || MediaService.userPaused) wasPlaying = false;
+                                    else if (wasPlaying && resumeTries < 40
+                                            && System.currentTimeMillis() - lastResume > 1200) {
+                                        lastResume = System.currentTimeMillis();
+                                        resumeTries++;
+                                        cmd("play", 0);
+                                    }
                                     MediaService.push(getApplicationContext(), title, artist, cover,
                                             (long) (cur * 1000), (long) (dur * 1000), playing, hasPrev, hasNext);
                                 }
@@ -1023,8 +1043,15 @@ jobs:
               }
 
               @Override
+              protected void onStart() {
+                  super.onStart();
+                  bg = false;
+              }
+
+              @Override
               protected void onStop() {
                   super.onStop();
+                  bg = true;
                   keepAlive();
               }
 
@@ -1110,6 +1137,7 @@ jobs:
 
               static volatile boolean running = false;
               static volatile boolean playing = false;
+              static volatile boolean userPaused = false;
 
               private static String sTitle = "", sArtist = "", sCover = "";
               private static long sPos = 0, sDur = 0;
@@ -1119,6 +1147,13 @@ jobs:
               private NotificationManager nm;
               private PowerManager.WakeLock wl;
               private final Handler main = new Handler(Looper.getMainLooper());
+              private final Runnable keep = new Runnable() {
+                  @Override public void run() {
+                      if (!running) return;
+                      if (playing) MainActivity.poke();
+                      main.postDelayed(this, 3000);
+                  }
+              };
 
               private Bitmap art;
               private String artUrl = "";
@@ -1189,9 +1224,12 @@ jobs:
                   PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                   wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vn:media");
                   wl.setReferenceCounted(false);
+                  main.postDelayed(keep, 3000);
               }
 
               private void send(String a, double v) {
+                  if ("pause".equals(a)) userPaused = true;
+                  else if ("play".equals(a)) userPaused = false;
                   if (!MainActivity.cmd(a, v)) shutdown();
               }
 
@@ -1372,6 +1410,7 @@ jobs:
 
               @Override
               public void onDestroy() {
+                  main.removeCallbacks(keep);
                   running = false;
                   playing = false;
                   try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) { }
