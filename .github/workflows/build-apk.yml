@@ -177,6 +177,26 @@ jobs:
               </style>
           </resources>
           EOF_6
+          mkdir -p app/src/main/res/values-v31 app/src/main/res/drawable
+          cat > app/src/main/res/values-v31/styles.xml <<'EOF_6B'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:statusBarColor">@android:color/black</item>
+                  <item name="android:navigationBarColor">@android:color/black</item>
+                  <item name="android:windowSplashScreenBackground">@android:color/black</item>
+                  <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_empty</item>
+                  <item name="android:windowSplashScreenAnimationDuration">0</item>
+              </style>
+          </resources>
+          EOF_6B
+          cat > app/src/main/res/drawable/splash_empty.xml <<'EOF_6C'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#00000000" android:pathData="M0,0h1v1h-1z" />
+          </vector>
+          EOF_6C
           mkdir -p app/src/main/res/xml
           cat > app/src/main/res/xml/file_paths.xml <<'EOF_7'
           <?xml version="1.0" encoding="utf-8"?>
@@ -185,6 +205,9 @@ jobs:
               <cache-path name="updates" path="updates/" />
           </paths>
           EOF_7
+          mkdir -p app/src/main/assets
+          # Acilis ekrani yazi tipi (Lexend). Inemezse uygulama otomatik kalin sistem fontuna doner.
+          curl -fsSL --retry 3 -o app/src/main/assets/lexend.ttf 'https://raw.githubusercontent.com/google/fonts/main/ofl/lexend/Lexend%5Bwght%5D.ttf' || rm -f app/src/main/assets/lexend.ttf
           mkdir -p app/src/main/java/com/vn/app
           cat > app/src/main/java/com/vn/app/MainActivity.java <<'EOF_8'
           package com.vn.app;
@@ -209,6 +232,10 @@ jobs:
           import java.util.Arrays;
           import java.util.HashSet;
           import java.util.Set;
+          import java.util.Random;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.ViewTreeObserver;
           import android.app.Activity;
           import android.content.ClipData;
           import android.content.Intent;
@@ -287,6 +314,11 @@ jobs:
               }
               private SharedPreferences prefs;
               private FrameLayout root;
+              // ===== ACILIS EKRANI (splash) =====
+              private FrameLayout splash;
+              private TextView splV, splN;
+              private final Handler splH = new Handler(Looper.getMainLooper());
+              private boolean splAnimDone = false, splPageReady = false, splEntryReady = false, splGone = false;
               private LinearLayout offline;
               private TextView offBtn;
               private boolean loadFailed = false;
@@ -329,6 +361,7 @@ jobs:
                   root.addView(webView, new FrameLayout.LayoutParams(MP, MP));
                   setContentView(root);
                   buildOffline();
+                  if (savedInstanceState == null) buildSplash();
                   webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
 
                   WebSettings s = webView.getSettings();
@@ -363,6 +396,7 @@ jobs:
                                 @Override
                                 public void onPageFinished(WebView view, String url) {
                                     if (!loadFailed) hideOffline();
+                                    splPageReady = true; splTry();
                                 }
 
                                 @Override
@@ -370,6 +404,7 @@ jobs:
                                     if (request != null && request.isForMainFrame()) {
                                         loadFailed = true;
                                         showOffline();
+                                        splPageReady = true; splTry();
                                     }
                                 }
 
@@ -435,6 +470,7 @@ jobs:
                                   prefs.edit().putInt("themeBg", themeBg).apply();
                                   root.setBackgroundColor(themeBg);
                                   offline.setBackgroundColor(themeBg);
+                                  if (splash != null) splash.setBackgroundColor(themeBg);
                                   getWindow().setStatusBarColor(c);
                                   getWindow().setNavigationBarColor(c);
                               } catch (Exception ignored) { }
@@ -523,6 +559,100 @@ jobs:
                   return true;
               }
 
+              // ===================== ACILIS EKRANI =====================
+              // Tema renginde duz zemin + ortada Lexend kalin "VN". Iki harf bagimsiz ve rastgele araliklarla
+              // yanip soner, 1,5 sn'de ikisi de tamamen soner; sonra zemin 0,5 sn'de solarak siteye (PIN ekranina) yer verir.
+              private static final int SPL_BLINK_MS = 1500;
+              private static final int SPL_FADE_MS = 500;
+
+              private Typeface splashFont() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          return new Typeface.Builder(getAssets(), "lexend.ttf")
+                                  .setFontVariationSettings("'wght' 700").build();
+                      }
+                      return Typeface.createFromAsset(getAssets(), "lexend.ttf");
+                  } catch (Throwable t) {
+                      return null;
+                  }
+              }
+
+              private TextView splLetter(String ch) {
+                  TextView t = new TextView(this);
+                  t.setText(ch);
+                  t.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 96);
+                  t.setTextColor(mix(themeBg, 0xFFFFFFFF, 0.96f));
+                  t.setIncludeFontPadding(false);
+                  t.setGravity(Gravity.CENTER);
+                  Typeface f = splashFont();
+                  if (f != null) t.setTypeface(f);
+                  else { t.setTypeface(Typeface.DEFAULT_BOLD); t.getPaint().setFakeBoldText(true); }
+                  return t;
+              }
+
+              private void buildSplash() {
+                  splash = new FrameLayout(this);
+                  splash.setBackgroundColor(themeBg);
+                  splash.setClickable(true);
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER);
+                  splV = splLetter("V");
+                  splN = splLetter("N");
+                  row.addView(splV, new LinearLayout.LayoutParams(WC, WC));
+                  row.addView(splN, new LinearLayout.LayoutParams(WC, WC));
+                  splash.addView(row, new FrameLayout.LayoutParams(WC, WC, Gravity.CENTER));
+                  root.addView(splash, new FrameLayout.LayoutParams(MP, MP));
+
+                  // Zamanlayici ilk cizimden sonra baslar (acilistaki gecikme animasyonu yemesin)
+                  splash.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+                      @Override public boolean onPreDraw() {
+                          splash.getViewTreeObserver().removeOnPreDrawListener(this);
+                          splStart();
+                          return true;
+                      }
+                  });
+                  // Guvenlik: site cok gec gelirse bile en fazla 8 sn sonra ekrani ac
+                  splH.postDelayed(() -> { splAnimDone = true; splPageReady = true; splEntryReady = true; splTry(); }, 8000);
+              }
+
+              // Bir harf: acik baslar, rastgele araliklarla ters cevrilir, sonda KAPALI biter
+              private void splBlink(final View v, Random r, int endAt) {
+                  int t = 40 + r.nextInt(120);
+                  boolean on = true;
+                  while (t < endAt - 60) {
+                      final boolean next = !on;
+                      splH.postDelayed(() -> { if (!splGone) v.setAlpha(next ? 1f : 0f); }, t);
+                      on = next;
+                      t += 35 + r.nextInt(130);
+                  }
+                  if (on) splH.postDelayed(() -> v.setAlpha(0f), endAt);
+              }
+
+              private void splStart() {
+                  Random r = new Random();
+                  splBlink(splV, r, SPL_BLINK_MS - r.nextInt(120));
+                  splBlink(splN, r, SPL_BLINK_MS - r.nextInt(120));
+                  splH.postDelayed(() -> {
+                      if (splV != null) splV.setAlpha(0f);
+                      if (splN != null) splN.setAlpha(0f);
+                      splAnimDone = true;
+                      splTry();
+                  }, SPL_BLINK_MS);
+              }
+
+              // Animasyon bitti + site/guncelleme karari hazir -> zemini 0,5 sn'de erit
+              private void splTry() {
+                  if (splash == null || splGone || !splAnimDone || !splPageReady || !splEntryReady) return;
+                  splGone = true;
+                  splH.postDelayed(() -> {
+                      if (splash == null) return;
+                      splash.animate().alpha(0f).setDuration(SPL_FADE_MS).withEndAction(() -> {
+                          try { root.removeView(splash); } catch (Throwable ignored) { }
+                          splash = null; splV = null; splN = null;
+                      }).start();
+                  }, 120);
+              }
               // ===================== INTERNET YOK EKRANI =====================
               private void buildOffline() {
                   offline = new LinearLayout(this);
@@ -843,6 +973,7 @@ jobs:
               // Site, guncelleme kontrolu bitene kadar gizli kalir; guncelleme yoksa (veya kontrol edilemediyse) acilir
               private void allowEntry() {
                   if (webView != null) webView.setVisibility(View.VISIBLE);
+                  splEntryReady = true; splTry();
               }
 
               private void checkForUpdate() {
@@ -871,6 +1002,7 @@ jobs:
               private void showUpdateDialog(String version, String notes, final String url) {
                   if (isFinishing() || updateShown) return;
                   updateShown = true;
+                  splEntryReady = true; splPageReady = true; splTry();
                   if (webView != null) webView.setVisibility(View.INVISIBLE);
                   Dialog d = openCard();
                   renderOffer(version, notes, url);
