@@ -203,6 +203,15 @@ jobs:
           import android.widget.ProgressBar;
           import android.widget.TextView;
           import android.widget.Toast;
+          import android.app.Dialog;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.Window;
+          import android.widget.ScrollView;
 
           import androidx.core.content.FileProvider;
 
@@ -241,6 +250,7 @@ jobs:
 
                   webView = new WebView(this);
                   setContentView(webView);
+                  webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
 
                   WebSettings s = webView.getSettings();
                   s.setJavaScriptEnabled(true);
@@ -313,6 +323,7 @@ jobs:
                           runOnUiThread(() -> {
                               try {
                                   int c = Color.parseColor(hex);
+                                  themeBg = c | 0xFF000000;
                                   getWindow().setStatusBarColor(c);
                                   getWindow().setNavigationBarColor(c);
                               } catch (Exception ignored) { }
@@ -432,12 +443,94 @@ jobs:
               // ===================== OTOMATIK GUNCELLEME =====================
               // __REPO__ derleme sirasinda otomatik olarak bu GitHub deposunun adiyla degisir.
               private static final String UPDATE_REPO = "__REPO__";
+              private static final int MP = ViewGroup.LayoutParams.MATCH_PARENT;
+              private static final int WC = ViewGroup.LayoutParams.WRAP_CONTENT;
+
               private File pendingApk;
-              private AlertDialog progressDialog;
-              private ProgressBar progressBar;
-              private TextView progressText;
+              private Dialog updDialog;
+              private LinearLayout updBox;
+              private TextView updPct;
+              private View updFillV;
+              private View updRestV;
               private boolean downloading = false;
               private boolean updateShown = false;
+              private int themeBg = 0xFF000000; // sitenin tema rengi (setBarColor ile gelir)
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              private int mix(int c, int with, float t) {
+                  int r = (int) (Color.red(c) * (1 - t) + Color.red(with) * t);
+                  int g = (int) (Color.green(c) * (1 - t) + Color.green(with) * t);
+                  int b = (int) (Color.blue(c) * (1 - t) + Color.blue(with) * t);
+                  return Color.rgb(r, g, b);
+              }
+
+              private GradientDrawable round(int color, int radiusDp) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(color);
+                  g.setCornerRadius(dp(radiusDp));
+                  return g;
+              }
+
+              private LinearLayout.LayoutParams lp(int w, int h, int topDp) {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, h);
+                  p.topMargin = dp(topDp);
+                  return p;
+              }
+
+              private TextView label(String text, int sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(text);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  t.setGravity(Gravity.CENTER);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              private TextView button(String text, boolean primary, View.OnClickListener l) {
+                  TextView b = label(text, 15, primary ? 0xFF000000 : 0xFF9B9B9B, primary);
+                  if (primary) b.setBackground(round(0xFFFFFFFF, 14));
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private View iconCircle(String glyph) {
+                  TextView t = label(glyph, 26, 0xFF000000, true);
+                  t.setBackground(round(0xFFFFFFFF, 28));
+                  t.setLayoutParams(new LinearLayout.LayoutParams(dp(56), dp(56)));
+                  return t;
+              }
+
+              // Tema renginde, yuvarlak koseli kart seklinde bir pencere olusturur
+              private Dialog openCard() {
+                  if (updDialog != null) {
+                      try { updDialog.dismiss(); } catch (Exception ignored) { }
+                  }
+                  updBox = new LinearLayout(this);
+                  updBox.setOrientation(LinearLayout.VERTICAL);
+                  updBox.setGravity(Gravity.CENTER_HORIZONTAL);
+                  updBox.setPadding(dp(24), dp(28), dp(24), dp(24));
+                  GradientDrawable bg = round(mix(themeBg, 0xFFFFFFFF, 0.08f), 26);
+                  bg.setStroke(dp(1), mix(themeBg, 0xFFFFFFFF, 0.16f));
+                  updBox.setBackground(bg);
+
+                  Dialog d = new Dialog(this);
+                  d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  d.setContentView(updBox);
+                  Window w = d.getWindow();
+                  if (w != null) {
+                      w.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+                      w.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+                      w.setDimAmount(0.65f);
+                      int width = Math.min(getResources().getDisplayMetrics().widthPixels - dp(48), dp(380));
+                      w.setLayout(width, WC);
+                  }
+                  updDialog = d;
+                  return d;
+              }
 
               private int installedCode() {
                   try {
@@ -448,82 +541,166 @@ jobs:
                   }
               }
 
+              private String[] fetchUpdate() throws Exception {
+                  URL u = new URL("https://api.github.com/repos/" + UPDATE_REPO + "/releases/latest");
+                  HttpURLConnection c = (HttpURLConnection) u.openConnection();
+                  c.setConnectTimeout(6000);
+                  c.setReadTimeout(6000);
+                  c.setRequestProperty("Accept", "application/vnd.github+json");
+                  c.setRequestProperty("User-Agent", "VN-App");
+                  if (c.getResponseCode() != 200) return null;
+                  BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+                  StringBuilder sb = new StringBuilder();
+                  String line;
+                  while ((line = r.readLine()) != null) sb.append(line);
+                  r.close();
+
+                  JSONObject j = new JSONObject(sb.toString());
+                  int remote = Integer.parseInt(j.optString("tag_name", "").replaceAll("[^0-9]", ""));
+                  if (remote <= installedCode()) return null;
+
+                  String apkUrl = null;
+                  JSONArray assets = j.optJSONArray("assets");
+                  if (assets != null) {
+                      for (int i = 0; i < assets.length(); i++) {
+                          JSONObject a = assets.getJSONObject(i);
+                          if (a.optString("name").endsWith(".apk")) {
+                              apkUrl = a.optString("browser_download_url");
+                              break;
+                          }
+                      }
+                  }
+                  if (apkUrl == null) return null;
+                  return new String[]{"1." + remote, j.optString("body", ""), apkUrl};
+              }
+
+              // Site, guncelleme kontrolu bitene kadar gizli kalir; guncelleme yoksa (veya kontrol edilemediyse) acilir
+              private void allowEntry() {
+                  if (webView != null) webView.setVisibility(View.VISIBLE);
+              }
+
               private void checkForUpdate() {
                   new Thread(() -> {
+                      String[] r = null;
                       try {
-                          URL u = new URL("https://api.github.com/repos/" + UPDATE_REPO + "/releases/latest");
-                          HttpURLConnection c = (HttpURLConnection) u.openConnection();
-                          c.setConnectTimeout(8000);
-                          c.setReadTimeout(8000);
-                          c.setRequestProperty("Accept", "application/vnd.github+json");
-                          c.setRequestProperty("User-Agent", "VN-App");
-                          if (c.getResponseCode() != 200) return;
-                          BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
-                          StringBuilder sb = new StringBuilder();
-                          String line;
-                          while ((line = r.readLine()) != null) sb.append(line);
-                          r.close();
-
-                          JSONObject j = new JSONObject(sb.toString());
-                          int remote = Integer.parseInt(j.optString("tag_name", "").replaceAll("[^0-9]", ""));
-                          if (remote <= installedCode()) return;
-
-                          String apkUrl = null;
-                          JSONArray assets = j.optJSONArray("assets");
-                          if (assets != null) {
-                              for (int i = 0; i < assets.length(); i++) {
-                                  JSONObject a = assets.getJSONObject(i);
-                                  if (a.optString("name").endsWith(".apk")) {
-                                      apkUrl = a.optString("browser_download_url");
-                                      break;
-                                  }
-                              }
-                          }
-                          if (apkUrl == null) return;
-
-                          final String url = apkUrl;
-                          final String title = j.optString("name", "");
-                          final String notes = j.optString("body", "");
-                          runOnUiThread(() -> showUpdateDialog(title, notes, url));
+                          r = fetchUpdate();
                       } catch (Exception ignored) { }
+                      final String[] res = r;
+                      runOnUiThread(() -> {
+                          if (res == null) allowEntry();
+                          else showUpdateDialog(res[0], res[1], res[2]);
+                      });
                   }).start();
               }
 
-              private void showUpdateDialog(String title, String notes, final String url) {
+              // GitHub'in otomatik commit mesajlarini ("Update x", "Add files via upload"...) gosterme
+              private String cleanNotes(String s) {
+                  if (s == null) return null;
+                  s = s.trim();
+                  if (s.isEmpty() || s.startsWith("Uygulamanin yeni")) return null;
+                  if (s.length() < 80 && s.matches("(?s)(Update|Create|Delete|Add|Upload|Merge|Rename|Revert)\\b.*")) return null;
+                  return s;
+              }
+
+              private void showUpdateDialog(String version, String notes, final String url) {
                   if (isFinishing() || updateShown) return;
                   updateShown = true;
-                  String msg = (notes == null || notes.trim().isEmpty()) ? "Uygulamanin yeni surumu hazir." : notes.trim();
-                  new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                          .setTitle("Yeni guncelleme var")
-                          .setMessage(msg)
-                          .setCancelable(true)
-                          .setPositiveButton("Guncelle", (d, w) -> startDownload(url))
-                          .setNegativeButton("Sonra", null)
-                          .show();
+                  if (webView != null) webView.setVisibility(View.INVISIBLE);
+                  Dialog d = openCard();
+                  renderOffer(version, notes, url);
+                  d.setCancelable(false);
+                  d.setCanceledOnTouchOutside(false);
+                  d.show();
+                  updBox.setAlpha(0f);
+                  updBox.setScaleX(0.93f);
+                  updBox.setScaleY(0.93f);
+                  updBox.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(200).start();
+              }
+
+              private void renderOffer(String version, String notes, final String url) {
+                  LinearLayout b = updBox;
+                  b.removeAllViews();
+                  b.addView(iconCircle("\u2193"));
+                  b.addView(label("G\u00fcncelleme gerekli", 20, 0xFFFFFFFF, true), lp(MP, WC, 18));
+                  b.addView(label("S\u00fcr\u00fcm " + version, 13, 0xFF9B9B9B, false), lp(MP, WC, 4));
+                  b.addView(label("Devam etmek i\u00e7in uygulamay\u0131 g\u00fcncellemelisin.", 14, 0xFFCFCFCF, false), lp(MP, WC, 12));
+
+                  String n = cleanNotes(notes);
+                  if (n != null) {
+                      TextView nt = label(n, 14, 0xFFCFCFCF, false);
+                      nt.setGravity(Gravity.START);
+                      nt.setLineSpacing(0, 1.15f);
+                      nt.setPadding(dp(14), dp(12), dp(14), dp(12));
+                      ScrollView sv = new ScrollView(this) {
+                          @Override
+                          protected void onMeasure(int w, int h) {
+                              super.onMeasure(w, View.MeasureSpec.makeMeasureSpec(dp(150), View.MeasureSpec.AT_MOST));
+                          }
+                      };
+                      sv.setOverScrollMode(View.OVER_SCROLL_NEVER);
+                      sv.setBackground(round(0x14FFFFFF, 14));
+                      sv.addView(nt);
+                      b.addView(sv, lp(MP, WC, 16));
+                  }
+
+                  b.addView(button("G\u00fcncelle", true, v -> startDownload(url)), lp(MP, dp(50), 22));
+              }
+
+              private void renderReady(final File apk) {
+                  if (updDialog == null) return;
+                  updDialog.setCancelable(false);
+                  LinearLayout b = updBox;
+                  b.removeAllViews();
+                  b.addView(iconCircle("\u2713"));
+                  b.addView(label("G\u00fcncelleme indirildi", 20, 0xFFFFFFFF, true), lp(MP, WC, 18));
+                  b.addView(label("Kurulumu tamamlamak i\u00e7in Y\u00fckle'ye bas.", 14, 0xFF9B9B9B, false), lp(MP, WC, 6));
+                  b.addView(button("Y\u00fckle", true, v -> installApk(apk)), lp(MP, dp(50), 22));
+              }
+
+              private void setProgress(int pct) {
+                  if (updPct == null || updFillV == null || updRestV == null) return;
+                  updPct.setText("%" + pct);
+                  ((LinearLayout.LayoutParams) updFillV.getLayoutParams()).weight = pct;
+                  ((LinearLayout.LayoutParams) updRestV.getLayoutParams()).weight = 100 - pct;
+                  updFillV.requestLayout();
+                  updRestV.requestLayout();
+              }
+
+              private void renderError(final String url) {
+                  downloading = false;
+                  if (updDialog == null) return;
+                  updDialog.setCancelable(false);
+                  LinearLayout b = updBox;
+                  b.removeAllViews();
+                  b.addView(iconCircle("!"));
+                  b.addView(label("\u0130ndirilemedi", 20, 0xFFFFFFFF, true), lp(MP, WC, 18));
+                  b.addView(label("\u0130nternet ba\u011flant\u0131n\u0131 kontrol edip tekrar dene.", 14, 0xFF9B9B9B, false), lp(MP, WC, 6));
+                  b.addView(button("Tekrar dene", true, v -> startDownload(url)), lp(MP, dp(50), 22));
               }
 
               private void startDownload(final String url) {
-                  if (downloading) return;
+                  if (downloading || updDialog == null) return;
                   downloading = true;
+                  updDialog.setCancelable(false);
 
-                  LinearLayout box = new LinearLayout(this);
-                  box.setOrientation(LinearLayout.VERTICAL);
-                  int pad = (int) (20 * getResources().getDisplayMetrics().density);
-                  box.setPadding(pad, pad, pad, pad);
-                  progressText = new TextView(this);
-                  progressText.setText("Indiriliyor... %0");
-                  progressText.setTextColor(0xFFFFFFFF);
-                  progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-                  progressBar.setMax(100);
-                  box.addView(progressText);
-                  box.addView(progressBar);
+                  LinearLayout b = updBox;
+                  b.removeAllViews();
+                  b.addView(iconCircle("\u2193"));
+                  b.addView(label("\u0130ndiriliyor", 20, 0xFFFFFFFF, true), lp(MP, WC, 18));
+                  updPct = label("%0", 34, 0xFFFFFFFF, true);
+                  b.addView(updPct, lp(MP, WC, 8));
 
-                  progressDialog = new AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
-                          .setTitle("Guncelleniyor")
-                          .setView(box)
-                          .setCancelable(false)
-                          .create();
-                  progressDialog.show();
+                  LinearLayout track = new LinearLayout(this);
+                  track.setOrientation(LinearLayout.HORIZONTAL);
+                  track.setBackground(round(0x26FFFFFF, 4));
+                  updFillV = new View(this);
+                  updFillV.setBackground(round(0xFFFFFFFF, 4));
+                  updRestV = new View(this);
+                  track.addView(updFillV, new LinearLayout.LayoutParams(0, MP, 0f));
+                  track.addView(updRestV, new LinearLayout.LayoutParams(0, MP, 100f));
+                  b.addView(track, lp(MP, dp(8), 14));
+
+                  b.addView(label("L\u00fctfen uygulamay\u0131 kapatma", 13, 0xFF9B9B9B, false), lp(MP, WC, 16));
 
                   new Thread(() -> {
                       try {
@@ -549,10 +726,7 @@ jobs:
                                   final int pct = (int) (done * 100 / total);
                                   if (pct != lastPct) {
                                       lastPct = pct;
-                                      runOnUiThread(() -> {
-                                          progressBar.setProgress(pct);
-                                          progressText.setText("Indiriliyor... %" + pct);
-                                      });
+                                      runOnUiThread(() -> setProgress(pct));
                                   }
                               }
                           }
@@ -561,16 +735,11 @@ jobs:
 
                           runOnUiThread(() -> {
                               downloading = false;
-                              if (progressDialog != null) progressDialog.dismiss();
+                              renderReady(out);
                               installApk(out);
                           });
                       } catch (Exception e) {
-                          runOnUiThread(() -> {
-                              downloading = false;
-                              updateShown = false;
-                              if (progressDialog != null) progressDialog.dismiss();
-                              Toast.makeText(MainActivity.this, "Guncelleme indirilemedi. Internetini kontrol edip tekrar dene.", Toast.LENGTH_LONG).show();
-                          });
+                          runOnUiThread(() -> renderError(url));
                       }
                   }).start();
               }
@@ -579,7 +748,7 @@ jobs:
                   if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
                       // Ilk seferde Android "bu uygulamaya yukleme izni ver" ekranini acar
                       pendingApk = apk;
-                      Toast.makeText(this, "Guncellemeyi yuklemek icin bu uygulamaya izin ver, sonra geri don.", Toast.LENGTH_LONG).show();
+                      Toast.makeText(this, "G\u00fcncellemeyi y\u00fcklemek i\u00e7in bu uygulamaya izin ver, sonra geri d\u00f6n.", Toast.LENGTH_LONG).show();
                       startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                               Uri.parse("package:" + getPackageName())));
                       return;
@@ -591,7 +760,7 @@ jobs:
                       i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
                       startActivity(i);
                   } catch (Exception e) {
-                      Toast.makeText(this, "Guncelleme baslatilamadi.", Toast.LENGTH_LONG).show();
+                      Toast.makeText(this, "G\u00fcncelleme ba\u015flat\u0131lamad\u0131.", Toast.LENGTH_LONG).show();
                   }
               }
 
