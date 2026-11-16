@@ -125,7 +125,7 @@ jobs:
               </queries>
 
               <application
-                  android:allowBackup="true"
+                  android:allowBackup="false"
                   android:icon="@mipmap/ic_launcher"
                   android:roundIcon="@mipmap/ic_launcher"
                   android:label="@string/app_name"
@@ -332,6 +332,8 @@ jobs:
                   webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
 
                   WebSettings s = webView.getSettings();
+                  s.setSaveFormData(false);
+                  try { webView.clearCache(true); webView.clearHistory(); webView.clearFormData(); } catch (Throwable ignored) { }
                   s.setJavaScriptEnabled(true);
                   s.setUserAgentString(s.getUserAgentString() + " VNApp/1");
                   s.setDomStorageEnabled(true);
@@ -1071,6 +1073,7 @@ jobs:
                       MediaService.stop(this);
                       if (inst != null && inst.get() == this) inst = null;
                       try {
+                          try { webView.clearCache(true); webView.clearHistory(); webView.clearFormData(); } catch (Throwable ignored) { }
                           root.removeView(webView);
                           webView.destroy();
                       } catch (Exception ignored) { }
