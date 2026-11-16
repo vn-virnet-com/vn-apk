@@ -67,8 +67,17 @@ jobs:
                   applicationId "com.vn.app"
                   minSdk 24
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 3
+                  versionName "1.2"
+              }
+
+              signingConfigs {
+                  debug {
+                      storeFile file('../vn.keystore')
+                      storePassword 'vnapp123'
+                      keyAlias 'vn'
+                      keyPassword 'vnapp123'
+                  }
               }
 
               buildTypes {
@@ -84,6 +93,10 @@ jobs:
                   targetCompatibility JavaVersion.VERSION_17
               }
           }
+
+          dependencies {
+              implementation 'androidx.core:core:1.12.0'
+          }
           EOF_3
           mkdir -p app/src/main
           cat > app/src/main/AndroidManifest.xml <<'EOF_4'
@@ -92,10 +105,15 @@ jobs:
 
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-              <uses-permission android:name="android.permission.CAMERA" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
               <uses-permission android:name="android.permission.VIBRATE" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.media.action.IMAGE_CAPTURE" />
+                  </intent>
+              </queries>
 
               <application
                   android:allowBackup="true"
@@ -104,6 +122,16 @@ jobs:
                   android:label="@string/app_name"
                   android:usesCleartextTraffic="false"
                   android:theme="@style/AppTheme">
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
 
                   <activity
                       android:name=".MainActivity"
@@ -134,19 +162,29 @@ jobs:
               </style>
           </resources>
           EOF_6
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="photos" path="photos/" />
+          </paths>
+          EOF_7
           mkdir -p app/src/main/java/com/vn/app
-          cat > app/src/main/java/com/vn/app/MainActivity.java <<'EOF_7'
+          cat > app/src/main/java/com/vn/app/MainActivity.java <<'EOF_8'
           package com.vn.app;
 
           import android.Manifest;
           import android.app.Activity;
+          import android.content.ClipData;
           import android.content.Intent;
           import android.content.pm.PackageManager;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
-          import android.view.View;
+          import android.provider.MediaStore;
+          import android.view.WindowManager;
           import android.webkit.CookieManager;
+          import android.webkit.JavascriptInterface;
           import android.webkit.PermissionRequest;
           import android.webkit.ValueCallback;
           import android.webkit.WebChromeClient;
@@ -154,6 +192,10 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
+
+          import androidx.core.content.FileProvider;
+
+          import java.io.File;
 
           public class MainActivity extends Activity {
 
@@ -163,12 +205,20 @@ jobs:
 
               private WebView webView;
               private ValueCallback<Uri[]> fileCallback;
+              private Uri cameraUri;
+              private PermissionRequest pendingPerm;
+
               private static final int FILE_REQ = 1;
+              private static final int CAMERA_REQ = 3;
               private static final int PERM_REQ = 2;
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+
+                  // Varsayilan: ekran goruntusu ve ekran kaydi KAPALI (son uygulamalarda onizleme siyah)
+                  getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
+                          WindowManager.LayoutParams.FLAG_SECURE);
 
                   webView = new WebView(this);
                   setContentView(webView);
@@ -190,17 +240,10 @@ jobs:
                       public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                           Uri uri = request.getUrl();
                           String host = uri.getHost();
-                          String scheme = uri.getScheme();
                           if (host != null && host.equals(SITE_HOST)) {
                               return false;
                           }
-                          if ("http".equals(scheme) || "https".equals(scheme)) {
-                              // Baska siteler (ornegin YouTube linkleri) tarayicida acilsin
-                              try {
-                                  startActivity(new Intent(Intent.ACTION_VIEW, uri));
-                              } catch (Exception ignored) { }
-                              return true;
-                          }
+                          // Baska siteler (ornegin YouTube linkleri) tarayicida acilsin
                           try {
                               startActivity(new Intent(Intent.ACTION_VIEW, uri));
                           } catch (Exception ignored) { }
@@ -211,10 +254,7 @@ jobs:
                   webView.setWebChromeClient(new WebChromeClient() {
                       @Override
                       public void onPermissionRequest(final PermissionRequest request) {
-                          runOnUiThread(() -> {
-                              requestRuntimePermissions();
-                              request.grant(request.getResources());
-                          });
+                          runOnUiThread(() -> handleWebPermission(request));
                       }
 
                       @Override
@@ -222,6 +262,11 @@ jobs:
                                                        FileChooserParams params) {
                           if (fileCallback != null) fileCallback.onReceiveValue(null);
                           fileCallback = callback;
+
+                          // <input capture>: dogrudan kamera uygulamasini ac
+                          if (params.isCaptureEnabled() && wantsImage(params)) {
+                              if (launchCamera()) return true;
+                          }
                           try {
                               startActivityForResult(params.createIntent(), FILE_REQ);
                           } catch (Exception e) {
@@ -232,6 +277,19 @@ jobs:
                       }
                   });
 
+                  webView.addJavascriptInterface(new Object() {
+                      @JavascriptInterface
+                      public void setSecure(final boolean secure) {
+                          runOnUiThread(() -> {
+                              if (secure) {
+                                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                              } else {
+                                  getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                              }
+                          });
+                      }
+                  }, "VNApp");
+
                   if (savedInstanceState != null) {
                       webView.restoreState(savedInstanceState);
                   } else {
@@ -239,17 +297,79 @@ jobs:
                   }
               }
 
-              private void requestRuntimePermissions() {
-                  if (Build.VERSION.SDK_INT >= 23) {
-                      if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
-                              || checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                          requestPermissions(new String[]{Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO}, PERM_REQ);
+              private boolean wantsImage(WebChromeClient.FileChooserParams params) {
+                  String[] types = params.getAcceptTypes();
+                  if (types == null) return false;
+                  for (String t : types) {
+                      if (t != null && t.startsWith("image")) return true;
+                  }
+                  return false;
+              }
+
+              private boolean launchCamera() {
+                  try {
+                      File dir = new File(getCacheDir(), "photos");
+                      if (!dir.exists()) dir.mkdirs();
+                      File f = File.createTempFile("vn_", ".jpg", dir);
+                      cameraUri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", f);
+
+                      Intent i = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+                      i.putExtra(MediaStore.EXTRA_OUTPUT, cameraUri);
+                      i.setClipData(ClipData.newRawUri("", cameraUri));
+                      i.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                      startActivityForResult(i, CAMERA_REQ);
+                      return true;
+                  } catch (Exception e) {
+                      cameraUri = null;
+                      return false;
+                  }
+              }
+
+              // Sitenin mikrofon istegi (sesli mesaj): once Android iznini iste, sonra siteye ver
+              private void handleWebPermission(PermissionRequest request) {
+                  boolean wantsAudio = false;
+                  for (String r : request.getResources()) {
+                      if (PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) wantsAudio = true;
+                  }
+                  if (!wantsAudio) {
+                      request.deny();
+                      return;
+                  }
+                  if (Build.VERSION.SDK_INT >= 23
+                          && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      if (pendingPerm != null) pendingPerm.deny();
+                      pendingPerm = request;
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, PERM_REQ);
+                  } else {
+                      request.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE});
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == PERM_REQ && pendingPerm != null) {
+                      boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+                      if (ok) {
+                          pendingPerm.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE});
+                      } else {
+                          pendingPerm.deny();
                       }
+                      pendingPerm = null;
                   }
               }
 
               @Override
               protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == CAMERA_REQ && fileCallback != null) {
+                      Uri[] result = null;
+                      if (resultCode == RESULT_OK && cameraUri != null) {
+                          result = new Uri[]{cameraUri};
+                      }
+                      fileCallback.onReceiveValue(result);
+                      fileCallback = null;
+                      return;
+                  }
                   if (requestCode == FILE_REQ && fileCallback != null) {
                       Uri[] result = null;
                       if (resultCode == RESULT_OK && data != null) {
@@ -283,10 +403,10 @@ jobs:
                   CookieManager.getInstance().flush();
               }
           }
-          EOF_7
+          EOF_8
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           echo "iVBORw0KGgoAAAANSUhEUgAAAJAAAACQBAMAAAAVaP+LAAAAGFBMVEX////+/v78/Pz39/e7u7s9PT0CAgIAAABo/BndAAAD1ElEQVR42u2YvXbbNhiGn0/x1lj4qKRT0kiKrSmD4/6sPnb3OlOvoLfX40uIT3IBcpXOlgR3jUSAbjeb6EBLoiQqRs/p6VK8E0lAD1+8xAcSgqSkpKSkpKSkpKSkpKT/XP3+o12kdtzqAWFSb+0DjPsT6U43L8/dTtC2tOrcG7SHk3/g6LAHhMty1fjkFOB965f2r2G6cflulNdBe7XbH7wFyny4ujL4Dgiz340//q3W8YdjYPaJHSBCDki7t7y36edAEBwHl7rMxEi+GvYy4NVhcamSZaGz7NC6NZJlakZoVpx1aneULNvg1EEYB+jrYnnBq4KbGMAcoOvB6k5Q+dQDSG/RxXzrAJkpQHHU0S89tbojlwMUr5agTCAE7wAxh9NokL80dc9yawDMqEqjeCexIIxziHluq7OO7ym4eQUWc+h7kaDw0gNki8yOHSDX3QeDxYnEOnI5IP60urPpVBEtisMMbC8SZC8NIKY6W48IpDiXSJAEcgjPfT0isxr6wGdxoPIbC2jmq0WoNosAyIoTjQNV1YY/6QHtPhCCDbXmgd1paW/tzP71FkRUAckEMKPVqkLmzm/yKEeSOyA8syB/GAWXm7WJNhhpFKjc9w604yETBeTzGojip0xjQNUCgD9S2mceQvDrjs3ARjnCjw2IGH2Y4ObDatmpSvp8xyKwCZoAhAPf+vMhIrf2JhAzsFGg0kwdkHn8VkQ+VClJDIh9D2hx1D1zEEJtPXXX6kDCDkuboJt5FZKpZtHHGunOAmhxEuVIrgDCs6pic2oguTA5SPh+FAOqQtL+jSr4z6/q9fPGAmS372JAVUj4rYiA1oU6IBw+XmsQbr7ugnQ6AOZjWW/LX1gDqO9qhCOudLkMbBRouL1QQIzGDC0Y50AywG8UGvOvbA7gokD7y2oKLmy0VSlJFgPC52Hh7dPmrd0LG+KKFvBDXbxTtoZQFhfqYkFVSIDMu1uN7o2NdrQKab49jNJeGBcJWoQU2n663ehe2lhHSBWSC001FRg2W2oA5Q8hjbtNP5jeNT+4BlCoyk3mpukHQd6riwMhkwChbaeNYUzuGy01gYqq3Gzz4wkMNRI0bzuHn5gdM8Zd2zwOVIU02wUqzVDjQPhJCKV3u74X/MxuV08z6EprH1jblsJY4xzRdutfDw6oPSo3tnGg8t7LdR2keZ7X3ovhfryo7EcctcZlUeuoPsvWvkL82G5uIfYaQfnw6dVqKOXdNcCHUHuu4x9nUZtYRb+8X3zy86nGbEVF1+bca4Dx2nZ5Isb9G/tuyTT9+ZCUlJSUlJSUlJT0/9PfV9CUZwkEE4cAAAAASUVORK5CYII=" | base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-          echo "$RUNNER_TEMP/vnapp" > "$GITHUB_WORKSPACE/.vnpath"
+          echo "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" | base64 -d > vn.keystore
 
       - name: APK derle
         run: |
