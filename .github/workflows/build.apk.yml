@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -67,8 +69,8 @@ jobs:
                   applicationId "com.vn.app"
                   minSdk 24
                   targetSdk 34
-                  versionCode 3
-                  versionName "1.2"
+                  versionCode (project.findProperty('vc') ?: '3').toInteger()
+                  versionName (project.findProperty('vn') ?: '1.2')
               }
 
               signingConfigs {
@@ -108,6 +110,7 @@ jobs:
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
               <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
               <queries>
                   <intent>
@@ -167,6 +170,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <paths>
               <cache-path name="photos" path="photos/" />
+              <cache-path name="updates" path="updates/" />
           </paths>
           EOF_7
           mkdir -p app/src/main/java/com/vn/app
@@ -182,6 +186,7 @@ jobs:
           import android.os.Build;
           import android.os.Bundle;
           import android.provider.MediaStore;
+          import android.provider.Settings;
           import android.view.WindowManager;
           import android.webkit.CookieManager;
           import android.webkit.JavascriptInterface;
@@ -192,10 +197,23 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
+          import android.app.AlertDialog;
+          import android.widget.LinearLayout;
+          import android.widget.ProgressBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
 
           import androidx.core.content.FileProvider;
 
+          import java.io.BufferedReader;
           import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
 
           public class MainActivity extends Activity {
 
@@ -295,6 +313,8 @@ jobs:
                   } else {
                       webView.loadUrl(SITE_URL);
                   }
+
+                  checkForUpdate();
               }
 
               private boolean wantsImage(WebChromeClient.FileChooserParams params) {
@@ -397,24 +417,51 @@ jobs:
                   }
               }
 
-              @Override
-              protected void onPause() {
-                  super.onPause();
-                  CookieManager.getInstance().flush();
+              // ===================== OTOMATIK GUNCELLEME =====================
+              // __REPO__ derleme sirasinda otomatik olarak bu GitHub deposunun adiyla degisir.
+              private static final String UPDATE_REPO = "__REPO__";
+              private File pendingApk;
+              private AlertDialog progressDialog;
+              private ProgressBar progressBar;
+              private TextView progressText;
+              private boolean downloading = false;
+              private boolean updateShown = false;
+
+              private int installedCode() {
+                  try {
+                      android.content.pm.PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), 0);
+                      return (int) (Build.VERSION.SDK_INT >= 28 ? p.getLongVersionCode() : p.versionCode);
+                  } catch (Exception e) {
+                      return 0;
+                  }
               }
-          }
-          EOF_8
-          mkdir -p app/src/main/res/mipmap-xxxhdpi
-          echo "iVBORw0KGgoAAAANSUhEUgAAAJAAAACQBAMAAAAVaP+LAAAAGFBMVEX////+/v78/Pz39/e7u7s9PT0CAgIAAABo/BndAAAD1ElEQVR42u2YvXbbNhiGn0/x1lj4qKRT0kiKrSmD4/6sPnb3OlOvoLfX40uIT3IBcpXOlgR3jUSAbjeb6EBLoiQqRs/p6VK8E0lAD1+8xAcSgqSkpKSkpKSkpKSkpKT/XP3+o12kdtzqAWFSb+0DjPsT6U43L8/dTtC2tOrcG7SHk3/g6LAHhMty1fjkFOB965f2r2G6cflulNdBe7XbH7wFyny4ujL4Dgiz340//q3W8YdjYPaJHSBCDki7t7y36edAEBwHl7rMxEi+GvYy4NVhcamSZaGz7NC6NZJlakZoVpx1aneULNvg1EEYB+jrYnnBq4KbGMAcoOvB6k5Q+dQDSG/RxXzrAJkpQHHU0S89tbojlwMUr5agTCAE7wAxh9NokL80dc9yawDMqEqjeCexIIxziHluq7OO7ym4eQUWc+h7kaDw0gNki8yOHSDX3QeDxYnEOnI5IP60urPpVBEtisMMbC8SZC8NIKY6W48IpDiXSJAEcgjPfT0isxr6wGdxoPIbC2jmq0WoNosAyIoTjQNV1YY/6QHtPhCCDbXmgd1paW/tzP71FkRUAckEMKPVqkLmzm/yKEeSOyA8syB/GAWXm7WJNhhpFKjc9w604yETBeTzGojip0xjQNUCgD9S2mceQvDrjs3ARjnCjw2IGH2Y4ObDatmpSvp8xyKwCZoAhAPf+vMhIrf2JhAzsFGg0kwdkHn8VkQ+VClJDIh9D2hx1D1zEEJtPXXX6kDCDkuboJt5FZKpZtHHGunOAmhxEuVIrgDCs6pic2oguTA5SPh+FAOqQtL+jSr4z6/q9fPGAmS372JAVUj4rYiA1oU6IBw+XmsQbr7ugnQ6AOZjWW/LX1gDqO9qhCOudLkMbBRouL1QQIzGDC0Y50AywG8UGvOvbA7gokD7y2oKLmy0VSlJFgPC52Hh7dPmrd0LG+KKFvBDXbxTtoZQFhfqYkFVSIDMu1uN7o2NdrQKab49jNJeGBcJWoQU2n663ehe2lhHSBWSC001FRg2W2oA5Q8hjbtNP5jeNT+4BlCoyk3mpukHQd6riwMhkwChbaeNYUzuGy01gYqq3Gzz4wkMNRI0bzuHn5gdM8Zd2zwOVIU02wUqzVDjQPhJCKV3u74X/MxuV08z6EprH1jblsJY4xzRdutfDw6oPSo3tnGg8t7LdR2keZ7X3ovhfryo7EcctcZlUeuoPsvWvkL82G5uIfYaQfnw6dVqKOXdNcCHUHuu4x9nUZtYRb+8X3zy86nGbEVF1+bca4Dx2nZ5Isb9G/tuyTT9+ZCUlJSUlJSUlJT0/9PfV9CUZwkEE4cAAAAASUVORK5CYII=" | base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-          echo "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" | base64 -d > vn.keystore
 
-      - name: APK derle
-        run: |
-          cd "$RUNNER_TEMP/vnapp"
-          gradle assembleDebug --no-daemon
+              private void checkForUpdate() {
+                  new Thread(() -> {
+                      try {
+                          URL u = new URL("https://api.github.com/repos/" + UPDATE_REPO + "/releases/latest");
+                          HttpURLConnection c = (HttpURLConnection) u.openConnection();
+                          c.setConnectTimeout(8000);
+                          c.setReadTimeout(8000);
+                          c.setRequestProperty("Accept", "application/vnd.github+json");
+                          c.setRequestProperty("User-Agent", "VN-App");
+                          if (c.getResponseCode() != 200) return;
+                          BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+                          StringBuilder sb = new StringBuilder();
+                          String line;
+                          while ((line = r.readLine()) != null) sb.append(line);
+                          r.close();
 
-      - name: APK yukle
-        uses: actions/upload-artifact@v4
-        with:
-          name: VN-apk
-          path: ${{ runner.temp }}/vnapp/app/build/outputs/apk/debug/app-debug.apk
+                          JSONObject j = new JSONObject(sb.toString());
+                          int remote = Integer.parseInt(j.optString("tag_name", "").replaceAll("[^0-9]", ""));
+                          if (remote <= installedCode()) return;
+
+                          String apkUrl = null;
+                          JSONArray assets = j.optJSONArray("assets");
+                          if (assets != null) {
+                              for (int i = 0; i < assets.length(); i++) {
+                                  JSONObject a = assets.getJSONObject(i);
+                                  if (a.optString("name").endsWith(".apk")) {
+                                      apkUrl = a.optString("browser_download_url");
+                                      break;
+                                 
