@@ -20,11 +20,281 @@ jobs:
         with:
           gradle-version: 8.7
 
+      - name: Proje dosyalarini olustur
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/vnapp"
+          cd "$RUNNER_TEMP/vnapp"
+          cat > settings.gradle <<'EOF_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "VN"
+          include ':app'
+          EOF_0
+          cat > build.gradle <<'EOF_1'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_1
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF_2
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_3'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.vn.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.vn.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  debug {
+                      minifyEnabled false
+                  }
+                  release {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:usesCleartextTraffic="false"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboard|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_5'
+          <resources>
+              <string name="app_name">VN</string>
+          </resources>
+          EOF_5
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'EOF_6'
+          <resources>
+              <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+                  <item name="android:statusBarColor">@android:color/black</item>
+                  <item name="android:navigationBarColor">@android:color/black</item>
+              </style>
+          </resources>
+          EOF_6
+          mkdir -p app/src/main/java/com/vn/app
+          cat > app/src/main/java/com/vn/app/MainActivity.java <<'EOF_7'
+          package com.vn.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.webkit.CookieManager;
+          import android.webkit.PermissionRequest;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+
+              // Sitenin adresi. Degisirse sadece burayi guncelle.
+              private static final String SITE_URL = "https://vn-virnet-com.github.io/virnet/";
+              private static final String SITE_HOST = "vn-virnet-com.github.io";
+
+              private WebView webView;
+              private ValueCallback<Uri[]> fileCallback;
+              private static final int FILE_REQ = 1;
+              private static final int PERM_REQ = 2;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  s.setAllowFileAccess(true);
+                  s.setCacheMode(WebSettings.LOAD_DEFAULT);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri uri = request.getUrl();
+                          String host = uri.getHost();
+                          String scheme = uri.getScheme();
+                          if (host != null && host.equals(SITE_HOST)) {
+                              return false;
+                          }
+                          if ("http".equals(scheme) || "https".equals(scheme)) {
+                              // Baska siteler (ornegin YouTube linkleri) tarayicida acilsin
+                              try {
+                                  startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                              } catch (Exception ignored) { }
+                              return true;
+                          }
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                          } catch (Exception ignored) { }
+                          return true;
+                      }
+                  });
+
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onPermissionRequest(final PermissionRequest request) {
+                          runOnUiThread(() -> {
+                              requestRuntimePermissions();
+                              request.grant(request.getResources());
+                          });
+                      }
+
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                       FileChooserParams params) {
+                          if (fileCallback != null) fileCallback.onReceiveValue(null);
+                          fileCallback = callback;
+                          try {
+                              startActivityForResult(params.createIntent(), FILE_REQ);
+                          } catch (Exception e) {
+                              fileCallback = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+
+                  if (savedInstanceState != null) {
+                      webView.restoreState(savedInstanceState);
+                  } else {
+                      webView.loadUrl(SITE_URL);
+                  }
+              }
+
+              private void requestRuntimePermissions() {
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
+                              || checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO}, PERM_REQ);
+                      }
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  if (requestCode == FILE_REQ && fileCallback != null) {
+                      Uri[] result = null;
+                      if (resultCode == RESULT_OK && data != null) {
+                          result = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+                      }
+                      fileCallback.onReceiveValue(result);
+                      fileCallback = null;
+                      return;
+                  }
+                  super.onActivityResult(requestCode, resultCode, data);
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle outState) {
+                  super.onSaveInstanceState(outState);
+                  webView.saveState(outState);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  CookieManager.getInstance().flush();
+              }
+          }
+          EOF_7
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          echo "iVBORw0KGgoAAAANSUhEUgAAAJAAAACQBAMAAAAVaP+LAAAAGFBMVEX////+/v78/Pz39/e7u7s9PT0CAgIAAABo/BndAAAD1ElEQVR42u2YvXbbNhiGn0/x1lj4qKRT0kiKrSmD4/6sPnb3OlOvoLfX40uIT3IBcpXOlgR3jUSAbjeb6EBLoiQqRs/p6VK8E0lAD1+8xAcSgqSkpKSkpKSkpKSkpKT/XP3+o12kdtzqAWFSb+0DjPsT6U43L8/dTtC2tOrcG7SHk3/g6LAHhMty1fjkFOB965f2r2G6cflulNdBe7XbH7wFyny4ujL4Dgiz340//q3W8YdjYPaJHSBCDki7t7y36edAEBwHl7rMxEi+GvYy4NVhcamSZaGz7NC6NZJlakZoVpx1aneULNvg1EEYB+jrYnnBq4KbGMAcoOvB6k5Q+dQDSG/RxXzrAJkpQHHU0S89tbojlwMUr5agTCAE7wAxh9NokL80dc9yawDMqEqjeCexIIxziHluq7OO7ym4eQUWc+h7kaDw0gNki8yOHSDX3QeDxYnEOnI5IP60urPpVBEtisMMbC8SZC8NIKY6W48IpDiXSJAEcgjPfT0isxr6wGdxoPIbC2jmq0WoNosAyIoTjQNV1YY/6QHtPhCCDbXmgd1paW/tzP71FkRUAckEMKPVqkLmzm/yKEeSOyA8syB/GAWXm7WJNhhpFKjc9w604yETBeTzGojip0xjQNUCgD9S2mceQvDrjs3ARjnCjw2IGH2Y4ObDatmpSvp8xyKwCZoAhAPf+vMhIrf2JhAzsFGg0kwdkHn8VkQ+VClJDIh9D2hx1D1zEEJtPXXX6kDCDkuboJt5FZKpZtHHGunOAmhxEuVIrgDCs6pic2oguTA5SPh+FAOqQtL+jSr4z6/q9fPGAmS372JAVUj4rYiA1oU6IBw+XmsQbr7ugnQ6AOZjWW/LX1gDqO9qhCOudLkMbBRouL1QQIzGDC0Y50AywG8UGvOvbA7gokD7y2oKLmy0VSlJFgPC52Hh7dPmrd0LG+KKFvBDXbxTtoZQFhfqYkFVSIDMu1uN7o2NdrQKab49jNJeGBcJWoQU2n663ehe2lhHSBWSC001FRg2W2oA5Q8hjbtNP5jeNT+4BlCoyk3mpukHQd6riwMhkwChbaeNYUzuGy01gYqq3Gzz4wkMNRI0bzuHn5gdM8Zd2zwOVIU02wUqzVDjQPhJCKV3u74X/MxuV08z6EprH1jblsJY4xzRdutfDw6oPSo3tnGg8t7LdR2keZ7X3ovhfryo7EcctcZlUeuoPsvWvkL82G5uIfYaQfnw6dVqKOXdNcCHUHuu4x9nUZtYRb+8X3zy86nGbEVF1+bca4Dx2nZ5Isb9G/tuyTT9+ZCUlJSUlJSUlJT0/9PfV9CUZwkEE4cAAAAASUVORK5CYII=" | base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          echo "$RUNNER_TEMP/vnapp" > "$GITHUB_WORKSPACE/.vnpath"
+
       - name: APK derle
-        run: gradle assembleDebug --no-daemon
+        run: |
+          cd "$RUNNER_TEMP/vnapp"
+          gradle assembleDebug --no-daemon
 
       - name: APK yukle
         uses: actions/upload-artifact@v4
         with:
           name: VN-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ runner.temp }}/vnapp/app/build/outputs/apk/debug/app-debug.apk
