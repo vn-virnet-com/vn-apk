@@ -640,4 +640,6 @@ jobs:
         run: |
           cp "$RUNNER_TEMP/vnapp/app/build/outputs/apk/debug/app-debug.apk" "$RUNNER_TEMP/VN.apk"
           if [ -z "$NOTES" ]; then NOTES="Uygulamanin yeni surumu hazir."; fi
+          # Ayni numarali yayin zaten varsa (Re-run), once sil
+          gh release delete "v$VC" --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
           gh release create "v$VC" "$RUNNER_TEMP/VN.apk" --repo "${{ github.repository }}" --title "Surum $VC" --notes "$NOTES" --latest
