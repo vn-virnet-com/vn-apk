@@ -98,6 +98,7 @@ jobs:
 
           dependencies {
               implementation 'androidx.core:core:1.12.0'
+              implementation 'androidx.webkit:webkit:1.11.0'
           }
           EOF_3
           mkdir -p app/src/main
@@ -111,6 +112,11 @@ jobs:
               <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
               <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
               <queries>
                   <intent>
@@ -136,9 +142,15 @@ jobs:
                           android:resource="@xml/file_paths" />
                   </provider>
 
+                  <service
+                      android:name=".MediaService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaPlayback" />
+
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
+                      android:launchMode="singleTask"
                       android:configChanges="orientation|screenSize|keyboard|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
                       android:windowSoftInputMode="adjustResize">
                       <intent-filter>
@@ -178,6 +190,25 @@ jobs:
           package com.vn.app;
 
           import android.Manifest;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.graphics.RectF;
+          import android.net.ConnectivityManager;
+          import android.net.Network;
+          import android.os.Environment;
+          import android.util.Base64;
+          import android.webkit.WebResourceError;
+          import android.widget.FrameLayout;
+          import androidx.webkit.WebViewCompat;
+          import androidx.webkit.WebViewFeature;
+          import java.io.OutputStream;
+          import java.lang.ref.WeakReference;
+          import java.util.Arrays;
+          import java.util.HashSet;
+          import java.util.Set;
           import android.app.Activity;
           import android.content.ClipData;
           import android.content.Intent;
@@ -239,6 +270,34 @@ jobs:
               private static final int FILE_REQ = 1;
               private static final int CAMERA_REQ = 3;
               private static final int PERM_REQ = 2;
+              private static final int NOTIF_REQ = 4;
+              private static final int STORAGE_REQ = 5;
+
+              static WeakReference<MainActivity> inst;
+              private SharedPreferences prefs;
+              private FrameLayout root;
+              private LinearLayout offline;
+              private TextView offBtn;
+              private boolean loadFailed = false;
+              private boolean askedNotif = false;
+              private ConnectivityManager.NetworkCallback netCb;
+
+              // YouTube oynaticisi ekran kapaninca / arka planda "gorunmez" sanip durmasin
+              private static final String KEEP_JS = "(function(){try{var d=document;"
+                      + "['hidden','webkitHidden'].forEach(function(k){Object.defineProperty(d,k,{get:function(){return false},configurable:true});});"
+                      + "['visibilityState','webkitVisibilityState'].forEach(function(k){Object.defineProperty(d,k,{get:function(){return 'visible'},configurable:true});});"
+                      + "var b=function(e){e.stopImmediatePropagation();};"
+                      + "d.addEventListener('visibilitychange',b,true);d.addEventListener('webkitvisibilitychange',b,true);"
+                      + "}catch(e){}})();";
+
+              // Siteden medya komutu (bildirim paneli / kulaklik) gonderir
+              static boolean cmd(final String a, final double v) {
+                  final MainActivity m = inst == null ? null : inst.get();
+                  if (m == null || m.webView == null) return false;
+                  m.runOnUiThread(() -> m.webView.evaluateJavascript(
+                          "window.vnMedia&&window.vnMedia('" + a + "'," + v + ")", null));
+                  return true;
+              }
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -248,8 +307,17 @@ jobs:
                   getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE,
                           WindowManager.LayoutParams.FLAG_SECURE);
 
+                  inst = new WeakReference<>(this);
+                  prefs = getSharedPreferences("vn", MODE_PRIVATE);
+                  themeBg = prefs.getInt("themeBg", 0xFF000000);
+                  getWindow().setStatusBarColor(themeBg);
+                  getWindow().setNavigationBarColor(themeBg);
+                  root = new FrameLayout(this);
+                  root.setBackgroundColor(themeBg);
                   webView = new WebView(this);
-                  setContentView(webView);
+                  root.addView(webView, new FrameLayout.LayoutParams(MP, MP));
+                  setContentView(root);
+                  buildOffline();
                   webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
 
                   WebSettings s = webView.getSettings();
@@ -261,10 +329,36 @@ jobs:
                   s.setCacheMode(WebSettings.LOAD_DEFAULT);
                   s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
 
+                  try {
+                      if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                          Set<String> origins = new HashSet<>(Arrays.asList(
+                                  "https://www.youtube.com", "https://www.youtube-nocookie.com"));
+                          WebViewCompat.addDocumentStartJavaScript(webView, KEEP_JS, origins);
+                      }
+                  } catch (Throwable ignored) { }
+
                   CookieManager.getInstance().setAcceptCookie(true);
                   CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
 
                   webView.setWebViewClient(new WebViewClient() {
+                                @Override
+                                public void onPageStarted(WebView view, String url, android.graphics.Bitmap icon) {
+                                    loadFailed = false;
+                                }
+
+                                @Override
+                                public void onPageFinished(WebView view, String url) {
+                                    if (!loadFailed) hideOffline();
+                                }
+
+                                @Override
+                                public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                                    if (request != null && request.isForMainFrame()) {
+                                        loadFailed = true;
+                                        showOffline();
+                                    }
+                                }
+
                       @Override
                       public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                           Uri uri = request.getUrl();
@@ -324,12 +418,34 @@ jobs:
                               try {
                                   int c = Color.parseColor(hex);
                                   themeBg = c | 0xFF000000;
+                                  prefs.edit().putInt("themeBg", themeBg).apply();
+                                  root.setBackgroundColor(themeBg);
+                                  offline.setBackgroundColor(themeBg);
                                   getWindow().setStatusBarColor(c);
                                   getWindow().setNavigationBarColor(c);
                               } catch (Exception ignored) { }
                           });
                       }
-                  }, "VNApp");
+
+                                // Siteden gelen sarki bilgisi -> bildirim paneli (kapak, sure, ileri/geri)
+                                @JavascriptInterface
+                                public void media(String title, String artist, String cover, double cur, double dur,
+                                                  boolean playing, boolean hasPrev, boolean hasNext) {
+                                    if (playing) ensureNotifPerm();
+                                    MediaService.push(getApplicationContext(), title, artist, cover,
+                                            (long) (cur * 1000), (long) (dur * 1000), playing, hasPrev, hasNext);
+                                }
+
+                                // Fotografi galeriye (Pictures/VN) kaydeder
+                                @JavascriptInterface
+                                public boolean saveFile(String name, String mime, String b64) {
+                                    try {
+                                        return saveToGallery(name, mime, Base64.decode(b64, Base64.DEFAULT));
+                                    } catch (Throwable t) {
+                                        return false;
+                                    }
+                                }
+                            }, "VNApp");
 
                   if (savedInstanceState != null) {
                       webView.restoreState(savedInstanceState);
@@ -339,6 +455,129 @@ jobs:
 
                   checkForUpdate();
               }
+
+              private void ensureNotifPerm() {
+                  if (Build.VERSION.SDK_INT >= 33 && !askedNotif
+                          && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                      askedNotif = true;
+                      runOnUiThread(() -> requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, NOTIF_REQ));
+                  }
+              }
+
+              private boolean saveToGallery(String name, String mime, byte[] data) throws Exception {
+                  if (mime == null || mime.isEmpty()) mime = "image/jpeg";
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      ContentValues v = new ContentValues();
+                      v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                      v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                      v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/VN");
+                      v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                      Uri u = getContentResolver().insert(MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), v);
+                      if (u == null) return false;
+                      OutputStream os = getContentResolver().openOutputStream(u);
+                      os.write(data);
+                      os.close();
+                      v.clear();
+                      v.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                      getContentResolver().update(u, v, null, null);
+                      return true;
+                  }
+                  if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                      runOnUiThread(() -> requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, STORAGE_REQ));
+                      return false;
+                  }
+                  File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "VN");
+                  if (!dir.exists()) dir.mkdirs();
+                  File f = new File(dir, name);
+                  FileOutputStream fo = new FileOutputStream(f);
+                  fo.write(data);
+                  fo.close();
+                  sendBroadcast(new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE, Uri.fromFile(f)));
+                  return true;
+              }
+
+              // ===================== INTERNET YOK EKRANI =====================
+              private void buildOffline() {
+                  offline = new LinearLayout(this);
+                  offline.setOrientation(LinearLayout.VERTICAL);
+                  offline.setGravity(Gravity.CENTER);
+                  offline.setPadding(dp(32), dp(32), dp(32), dp(32));
+                  offline.setBackgroundColor(themeBg);
+                  offline.setClickable(true);
+                  offline.setVisibility(View.GONE);
+
+                  View ic = new WifiOffView(this);
+                  ic.setBackground(round(0xFFFFFFFF, 36));
+                  offline.addView(ic, new LinearLayout.LayoutParams(dp(72), dp(72)));
+                  offline.addView(label("Ba\u011flant\u0131 yok", 22, 0xFFFFFFFF, true), lp(MP, WC, 22));
+                  offline.addView(label("\u0130nternet ba\u011flant\u0131n\u0131 kontrol et, sonra tekrar dene.", 14, 0xFF9B9B9B, false), lp(MP, WC, 8));
+                  offBtn = button("Tekrar dene", true, v -> retryLoad());
+                  offline.addView(offBtn, lp(dp(200), dp(50), 28));
+                  root.addView(offline, new FrameLayout.LayoutParams(MP, MP));
+
+                  try {
+                      ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                      netCb = new ConnectivityManager.NetworkCallback() {
+                          @Override
+                          public void onAvailable(Network n) {
+                              runOnUiThread(() -> {
+                                  if (offline != null && offline.getVisibility() == View.VISIBLE) retryLoad();
+                              });
+                          }
+                      };
+                      cm.registerDefaultNetworkCallback(netCb);
+                  } catch (Exception ignored) { }
+              }
+
+              private void showOffline() {
+                  if (offline == null) return;
+                  offBtn.postDelayed(() -> {
+                      offBtn.setText("Tekrar dene");
+                      offBtn.setAlpha(1f);
+                  }, 600);
+                  offline.setVisibility(View.VISIBLE);
+              }
+
+              private void hideOffline() {
+                  if (offline != null) offline.setVisibility(View.GONE);
+              }
+
+              private void retryLoad() {
+                  offBtn.setText("Ba\u011flan\u0131yor...");
+                  offBtn.setAlpha(0.6f);
+                  loadFailed = false;
+                  webView.loadUrl(SITE_URL);
+              }
+
+              static class WifiOffView extends View {
+                  private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  WifiOffView(Context c) {
+                      super(c);
+                      p.setStrokeCap(Paint.Cap.ROUND);
+                  }
+                  @Override
+                  protected void onDraw(Canvas cv) {
+                      float w = getWidth(), h = getHeight(), u = w / 72f;
+                      float cx = w / 2f, cy = h * 0.66f;
+                      p.setColor(0xFF000000);
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(4.5f * u);
+                      for (int i = 1; i <= 3; i++) {
+                          float r = i * 10f * u;
+                          cv.drawArc(new RectF(cx - r, cy - r, cx + r, cy + r), 230f, 80f, false, p);
+                      }
+                      p.setStyle(Paint.Style.FILL);
+                      cv.drawCircle(cx, cy, 3.4f * u, p);
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setColor(0xFFFFFFFF);
+                      p.setStrokeWidth(10f * u);
+                      cv.drawLine(w * 0.24f, h * 0.22f, w * 0.76f, h * 0.78f, p);
+                      p.setColor(0xFF000000);
+                      p.setStrokeWidth(4.5f * u);
+                      cv.drawLine(w * 0.24f, h * 0.22f, w * 0.76f, h * 0.78f, p);
+                  }
+              }
+              // =================== INTERNET YOK EKRANI SONU ===================
 
               private boolean wantsImage(WebChromeClient.FileChooserParams params) {
                   String[] types = params.getAcceptTypes();
@@ -775,13 +1014,373 @@ jobs:
               }
               // =================== OTOMATIK GUNCELLEME SONU ===================
 
+              // Muzik caliyorsa ekran kapaninca / arka planda WebView durmasin
+              private void keepAlive() {
+                  if (MediaService.playing && webView != null) {
+                      webView.onResume();
+                      webView.resumeTimers();
+                  }
+              }
+
+              @Override
+              protected void onStop() {
+                  super.onStop();
+                  keepAlive();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (netCb != null) {
+                      try {
+                          ((ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE)).unregisterNetworkCallback(netCb);
+                      } catch (Exception ignored) { }
+                  }
+                  if (isFinishing()) {
+                      MediaService.stop(this);
+                      if (inst != null && inst.get() == this) inst = null;
+                      try {
+                          root.removeView(webView);
+                          webView.destroy();
+                      } catch (Exception ignored) { }
+                  }
+                  super.onDestroy();
+              }
+
               @Override
               protected void onPause() {
                   super.onPause();
                   CookieManager.getInstance().flush();
+                  keepAlive();
               }
           }
           EOF_8
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_stat.xml <<'EOF_20'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,3v10.55c-0.59,-0.34 -1.27,-0.55 -2,-0.55 -2.21,0 -4,1.79 -4,4s1.79,4 4,4 4,-1.79 4,-4V7h4V3h-6z" />
+          </vector>
+          EOF_20
+          cat > app/src/main/java/com/vn/app/MediaService.java <<'EOF_21'
+          package com.vn.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.graphics.drawable.Icon;
+          import android.media.MediaMetadata;
+          import android.media.session.MediaSession;
+          import android.media.session.PlaybackState;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.PowerManager;
+          import android.os.SystemClock;
+
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.ArrayList;
+
+          // Ekran kapaliyken / arka planda muzigi canli tutar ve bildirim panelinde (Samsung dahil) medya kontrolu gosterir
+          public class MediaService extends Service {
+
+              static final String CH = "vn_media";
+              static final int NID = 71;
+              static final String A_UPDATE = "com.vn.app.MEDIA_UPDATE";
+              static final String A_PLAY = "com.vn.app.MEDIA_PLAY";
+              static final String A_PAUSE = "com.vn.app.MEDIA_PAUSE";
+              static final String A_NEXT = "com.vn.app.MEDIA_NEXT";
+              static final String A_PREV = "com.vn.app.MEDIA_PREV";
+              static final String A_STOP = "com.vn.app.MEDIA_STOP";
+              static final String A_DISMISS = "com.vn.app.MEDIA_DISMISS";
+
+              static volatile boolean running = false;
+              static volatile boolean playing = false;
+
+              private static String sTitle = "", sArtist = "", sCover = "";
+              private static long sPos = 0, sDur = 0;
+              private static boolean sHasPrev = false, sHasNext = false;
+
+              private MediaSession session;
+              private NotificationManager nm;
+              private PowerManager.WakeLock wl;
+              private final Handler main = new Handler(Looper.getMainLooper());
+
+              private Bitmap art;
+              private String artUrl = "";
+              private String metaKey = "", notifKey = "";
+              private boolean lastPl = false, stateInit = false, fgStarted = false;
+              private long lastPos = 0, lastAt = 0;
+
+              // Siteden gelen guncel sarki bilgisini kaydeder ve servisi besler
+              static void push(Context c, String title, String artist, String cover, long posMs, long durMs,
+                               boolean pl, boolean prev, boolean next) {
+                  if (title == null || title.isEmpty()) {
+                      playing = false;
+                      if (running) {
+                          try { c.startService(new Intent(c, MediaService.class).setAction(A_STOP)); } catch (Exception ignored) { }
+                      }
+                      return;
+                  }
+                  sTitle = title;
+                  sArtist = artist == null ? "" : artist;
+                  sCover = cover == null ? "" : cover;
+                  sPos = posMs;
+                  sDur = durMs;
+                  sHasPrev = prev;
+                  sHasNext = next;
+                  playing = pl;
+                  // Servis yalniz sarki calarken baslatilir; zaten calisiyorsa duraklatilmis halde de guncellenir
+                  if (!running && !pl) return;
+                  Intent i = new Intent(c, MediaService.class).setAction(A_UPDATE);
+                  try {
+                      if (!running && Build.VERSION.SDK_INT >= 26) c.startForegroundService(i);
+                      else c.startService(i);
+                  } catch (Exception ignored) { }
+              }
+
+              static void stop(Context c) {
+                  playing = false;
+                  if (running) {
+                      try { c.startService(new Intent(c, MediaService.class).setAction(A_STOP)); } catch (Exception ignored) { }
+                  }
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  running = true;
+                  nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel(CH, "M\u00fczik", NotificationManager.IMPORTANCE_LOW);
+                      ch.setShowBadge(false);
+                      ch.setSound(null, null);
+                      nm.createNotificationChannel(ch);
+                  }
+                  session = new MediaSession(this, "VN");
+                  session.setCallback(new MediaSession.Callback() {
+                      @Override public void onPlay() { send("play", 0); }
+                      @Override public void onPause() { send("pause", 0); }
+                      @Override public void onSkipToNext() { send("next", 0); }
+                      @Override public void onSkipToPrevious() { send("prev", 0); }
+                      @Override public void onSeekTo(long pos) { send("seek", pos / 1000.0); }
+                      @Override public void onStop() { send("pause", 0); }
+                  });
+                  session.setActive(true);
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vn:media");
+                  wl.setReferenceCounted(false);
+              }
+
+              private void send(String a, double v) {
+                  if (!MainActivity.cmd(a, v)) shutdown();
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  String a = intent == null ? null : intent.getAction();
+                  if (A_STOP.equals(a)) {
+                      shutdown();
+                      return START_NOT_STICKY;
+                  }
+                  if (A_DISMISS.equals(a)) {
+                      if (playing) MainActivity.cmd("pause", 0);
+                      shutdown();
+                      return START_NOT_STICKY;
+                  }
+                  if (A_PLAY.equals(a)) { send("play", 0); }
+                  else if (A_PAUSE.equals(a)) { send("pause", 0); }
+                  else if (A_NEXT.equals(a)) { send("next", 0); }
+                  else if (A_PREV.equals(a)) { send("prev", 0); }
+                  render();
+                  return START_NOT_STICKY;
+              }
+
+              private void render() {
+                  if (sTitle.isEmpty()) {
+                      if (!fgStarted) { shutdown(); }
+                      return;
+                  }
+                  boolean pl = playing;
+
+                  String mk = sTitle + "|" + sArtist + "|" + sCover + "|" + sDur;
+                  if (!mk.equals(metaKey)) {
+                      metaKey = mk;
+                      if (!sCover.equals(artUrl)) { art = null; artUrl = sCover; loadCover(sCover); }
+                      applyMeta();
+                  }
+
+                  long now = SystemClock.elapsedRealtime();
+                  long expected = lastPl ? lastPos + (now - lastAt) : lastPos;
+                  if (!stateInit || pl != lastPl || Math.abs(sPos - expected) > 1500) {
+                      stateInit = true;
+                      lastPl = pl;
+                      lastPos = sPos;
+                      lastAt = now;
+                      applyState(pl);
+                  }
+
+                  String nk = mk + "|" + pl + "|" + sHasPrev + "|" + sHasNext + "|" + (art != null);
+                  if (!nk.equals(notifKey) || !fgStarted) {
+                      notifKey = nk;
+                      Notification n = buildNotification(pl);
+                      if (!fgStarted) {
+                          fgStarted = true;
+                          if (Build.VERSION.SDK_INT >= 29) {
+                              startForeground(NID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                          } else {
+                              startForeground(NID, n);
+                          }
+                      } else {
+                          nm.notify(NID, n);
+                      }
+                  }
+
+                  try {
+                      if (pl && !wl.isHeld()) wl.acquire(4 * 60 * 60 * 1000L);
+                      else if (!pl && wl.isHeld()) wl.release();
+                  } catch (Exception ignored) { }
+              }
+
+              private void applyMeta() {
+                  MediaMetadata.Builder b = new MediaMetadata.Builder()
+                          .putString(MediaMetadata.METADATA_KEY_TITLE, sTitle)
+                          .putString(MediaMetadata.METADATA_KEY_ARTIST, sArtist)
+                          .putLong(MediaMetadata.METADATA_KEY_DURATION, sDur);
+                  if (art != null) b.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art);
+                  session.setMetadata(b.build());
+              }
+
+              private void applyState(boolean pl) {
+                  long acts = PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE
+                          | PlaybackState.ACTION_PLAY_PAUSE | PlaybackState.ACTION_SEEK_TO;
+                  if (sHasPrev) acts |= PlaybackState.ACTION_SKIP_TO_PREVIOUS;
+                  if (sHasNext) acts |= PlaybackState.ACTION_SKIP_TO_NEXT;
+                  PlaybackState st = new PlaybackState.Builder()
+                          .setActions(acts)
+                          .setState(pl ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
+                                  sPos, pl ? 1f : 0f, SystemClock.elapsedRealtime())
+                          .build();
+                  session.setPlaybackState(st);
+              }
+
+              private PendingIntent act(String action, int code) {
+                  Intent i = new Intent(this, MediaService.class).setAction(action);
+                  int fl = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0);
+                  return PendingIntent.getService(this, code, i, fl);
+              }
+
+              private Notification.Action action(int icon, String title, PendingIntent pi) {
+                  return new Notification.Action.Builder(Icon.createWithResource(this, icon), title, pi).build();
+              }
+
+              private Notification buildNotification(boolean pl) {
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(this, CH) : new Notification.Builder(this);
+
+                  Intent open = new Intent(this, MainActivity.class);
+                  open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  PendingIntent content = PendingIntent.getActivity(this, 0, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+
+                  b.setSmallIcon(R.drawable.ic_stat)
+                          .setContentTitle(sTitle)
+                          .setContentText(sArtist)
+                          .setContentIntent(content)
+                          .setDeleteIntent(act(A_DISMISS, 9))
+                          .setOnlyAlertOnce(true)
+                          .setShowWhen(false)
+                          .setOngoing(pl)
+                          .setCategory(Notification.CATEGORY_TRANSPORT)
+                          .setVisibility(Notification.VISIBILITY_PUBLIC);
+                  if (art != null) b.setLargeIcon(art);
+
+                  ArrayList<Integer> compact = new ArrayList<>();
+                  int idx = 0;
+                  if (sHasPrev) {
+                      b.addAction(action(android.R.drawable.ic_media_previous, "\u00d6nceki", act(A_PREV, 1)));
+                      compact.add(idx++);
+                  }
+                  if (pl) b.addAction(action(android.R.drawable.ic_media_pause, "Duraklat", act(A_PAUSE, 2)));
+                  else b.addAction(action(android.R.drawable.ic_media_play, "Oynat", act(A_PLAY, 3)));
+                  compact.add(idx++);
+                  if (sHasNext) {
+                      b.addAction(action(android.R.drawable.ic_media_next, "Sonraki", act(A_NEXT, 4)));
+                      compact.add(idx++);
+                  }
+                  int[] ci = new int[compact.size()];
+                  for (int k = 0; k < ci.length; k++) ci[k] = compact.get(k);
+
+                  b.setStyle(new Notification.MediaStyle()
+                          .setMediaSession(session.getSessionToken())
+                          .setShowActionsInCompactView(ci));
+                  return b.build();
+              }
+
+              private void loadCover(final String url) {
+                  if (url == null || url.isEmpty()) return;
+                  new Thread(() -> {
+                      try {
+                          HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+                          c.setConnectTimeout(8000);
+                          c.setReadTimeout(8000);
+                          InputStream in = c.getInputStream();
+                          Bitmap bm = BitmapFactory.decodeStream(in);
+                          in.close();
+                          if (bm == null) return;
+                          int max = 640;
+                          if (bm.getWidth() > max) {
+                              bm = Bitmap.createScaledBitmap(bm, max, Math.max(1, bm.getHeight() * max / bm.getWidth()), true);
+                          }
+                          final Bitmap fb = bm;
+                          main.post(() -> {
+                              if (!url.equals(artUrl) || session == null) return;
+                              art = fb;
+                              applyMeta();
+                              render();
+                          });
+                      } catch (Exception ignored) { }
+                  }).start();
+              }
+
+              private void shutdown() {
+                  playing = false;
+                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) { }
+                  try { stopForeground(true); } catch (Exception ignored) { }
+                  try { nm.cancel(NID); } catch (Exception ignored) { }
+                  stopSelf();
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  playing = false;
+                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) { }
+                  try { session.setActive(false); session.release(); } catch (Exception ignored) { }
+                  session = null;
+                  super.onDestroy();
+              }
+          }
+          EOF_21
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           echo "iVBORw0KGgoAAAANSUhEUgAAAJAAAACQBAMAAAAVaP+LAAAAGFBMVEX////+/v78/Pz39/e7u7s9PT0CAgIAAABo/BndAAAD1ElEQVR42u2YvXbbNhiGn0/x1lj4qKRT0kiKrSmD4/6sPnb3OlOvoLfX40uIT3IBcpXOlgR3jUSAbjeb6EBLoiQqRs/p6VK8E0lAD1+8xAcSgqSkpKSkpKSkpKSkpKT/XP3+o12kdtzqAWFSb+0DjPsT6U43L8/dTtC2tOrcG7SHk3/g6LAHhMty1fjkFOB965f2r2G6cflulNdBe7XbH7wFyny4ujL4Dgiz340//q3W8YdjYPaJHSBCDki7t7y36edAEBwHl7rMxEi+GvYy4NVhcamSZaGz7NC6NZJlakZoVpx1aneULNvg1EEYB+jrYnnBq4KbGMAcoOvB6k5Q+dQDSG/RxXzrAJkpQHHU0S89tbojlwMUr5agTCAE7wAxh9NokL80dc9yawDMqEqjeCexIIxziHluq7OO7ym4eQUWc+h7kaDw0gNki8yOHSDX3QeDxYnEOnI5IP60urPpVBEtisMMbC8SZC8NIKY6W48IpDiXSJAEcgjPfT0isxr6wGdxoPIbC2jmq0WoNosAyIoTjQNV1YY/6QHtPhCCDbXmgd1paW/tzP71FkRUAckEMKPVqkLmzm/yKEeSOyA8syB/GAWXm7WJNhhpFKjc9w604yETBeTzGojip0xjQNUCgD9S2mceQvDrjs3ARjnCjw2IGH2Y4ObDatmpSvp8xyKwCZoAhAPf+vMhIrf2JhAzsFGg0kwdkHn8VkQ+VClJDIh9D2hx1D1zEEJtPXXX6kDCDkuboJt5FZKpZtHHGunOAmhxEuVIrgDCs6pic2oguTA5SPh+FAOqQtL+jSr4z6/q9fPGAmS372JAVUj4rYiA1oU6IBw+XmsQbr7ugnQ6AOZjWW/LX1gDqO9qhCOudLkMbBRouL1QQIzGDC0Y50AywG8UGvOvbA7gokD7y2oKLmy0VSlJFgPC52Hh7dPmrd0LG+KKFvBDXbxTtoZQFhfqYkFVSIDMu1uN7o2NdrQKab49jNJeGBcJWoQU2n663ehe2lhHSBWSC001FRg2W2oA5Q8hjbtNP5jeNT+4BlCoyk3mpukHQd6riwMhkwChbaeNYUzuGy01gYqq3Gzz4wkMNRI0bzuHn5gdM8Zd2zwOVIU02wUqzVDjQPhJCKV3u74X/MxuV08z6EprH1jblsJY4xzRdutfDw6oPSo3tnGg8t7LdR2keZ7X3ovhfryo7EcctcZlUeuoPsvWvkL82G5uIfYaQfnw6dVqKOXdNcCHUHuu4x9nUZtYRb+8X3zy86nGbEVF1+bca4Dx2nZ5Isb9G/tuyTT9+ZCUlJSUlJSUlJT0/9PfV9CUZwkEE4cAAAAASUVORK5CYII=" | base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
           echo "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" | base64 -d > vn.keystore
