@@ -176,6 +176,7 @@ jobs:
                   <item name="android:statusBarColor">@android:color/black</item>
                   <item name="android:navigationBarColor">@android:color/black</item>
                   <item name="android:windowFullscreen">true</item>
+                  <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
               </style>
           </resources>
           EOF_6
@@ -187,6 +188,7 @@ jobs:
                   <item name="android:statusBarColor">@android:color/black</item>
                   <item name="android:navigationBarColor">@android:color/black</item>
                   <item name="android:windowFullscreen">true</item>
+                  <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
                   <item name="android:windowSplashScreenBackground">@android:color/black</item>
                   <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_empty</item>
                   <item name="android:windowSplashScreenAnimationDuration">0</item>
@@ -294,6 +296,8 @@ jobs:
           import android.telephony.TelephonyManager;
           import android.view.WindowInsets;
           import androidx.core.view.WindowCompat;
+          import androidx.core.view.ViewCompat;
+          import androidx.core.graphics.Insets;
           import androidx.core.view.WindowInsetsCompat;
           import androidx.core.view.WindowInsetsControllerCompat;
 
@@ -374,6 +378,7 @@ jobs:
                   webView = new WebView(this);
                   root.addView(webView, new FrameLayout.LayoutParams(MP, MP));
                   setContentView(root);
+                  setupEdgeToEdge();
                   applyFullscreen();
                   buildOffline();
                   if (savedInstanceState == null) buildSplash();
@@ -1043,6 +1048,7 @@ jobs:
               }
 
               private void checkForUpdate() {
+                  lastUpdCheck = System.currentTimeMillis();
                   new Thread(() -> {
                       String[] r = null;
                       try {
@@ -1056,6 +1062,44 @@ jobs:
                   }).start();
               }
 
+              // ===== UYGULAMA ACIKKEN PERIYODIK GUNCELLEME KONTROLU =====
+              private static final long UPD_EVERY_MS = 5 * 60 * 1000L;   // on planda 5 dakikada bir
+              private static final long UPD_MIN_GAP_MS = 60 * 1000L;     // uygulamaya donuste en az 1 dk arayla
+              private long lastUpdCheck = 0;
+              private boolean updChecking = false;
+              private final Handler updH = new Handler(Looper.getMainLooper());
+              private final Runnable updTick = new Runnable() {
+                  @Override public void run() {
+                      quietUpdateCheck();
+                      updH.postDelayed(this, UPD_EVERY_MS);
+                  }
+              };
+
+              private void startUpdateWatch() {
+                  updH.removeCallbacks(updTick);
+                  long wait = Math.max(0, UPD_MIN_GAP_MS - (System.currentTimeMillis() - lastUpdCheck));
+                  updH.postDelayed(updTick, wait);
+              }
+
+              private void stopUpdateWatch() {
+                  updH.removeCallbacks(updTick);
+              }
+
+              // Guncelleme yoksa / kontrol edilemezse hicbir sey gostermez; varsa mevcut guncelleme penceresini acar
+              private void quietUpdateCheck() {
+                  if (updateShown || updChecking || isFinishing() || pendingApk != null) return;
+                  updChecking = true;
+                  lastUpdCheck = System.currentTimeMillis();
+                  new Thread(() -> {
+                      String[] r = null;
+                      try { r = fetchUpdate(); } catch (Exception ignored) { }
+                      final String[] res = r;
+                      runOnUiThread(() -> {
+                          updChecking = false;
+                          if (res != null) showUpdateDialog(res[0], res[1], res[2]);
+                      });
+                  }).start();
+              }
               // GitHub'in otomatik commit mesajlarini ("Update x", "Add files via upload"...) gosterme
               private String cleanNotes(String s) {
                   if (s == null) return null;
@@ -1253,6 +1297,21 @@ jobs:
               private static final boolean HIDE_NAV_BAR = false;
               private volatile int fsBarDp = 0;
 
+              // Icerigi ekranin en ustune (cent alani dahil) kadar uzatir. Ust bosluk 0: sitenin kendi ust bari orayi kaplar.
+              // Alt: gezinme cubugu veya klavye (hangisi buyukse). Yanlar: cubuk / cent.
+              private void setupEdgeToEdge() {
+                  try {
+                      WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+                      ViewCompat.setOnApplyWindowInsetsListener(root, (v, wi) -> {
+                          Insets b = wi.getInsets(WindowInsetsCompat.Type.systemBars()
+                                  | WindowInsetsCompat.Type.displayCutout()
+                                  | WindowInsetsCompat.Type.ime());
+                          v.setPadding(b.left, 0, b.right, b.bottom);
+                          return WindowInsetsCompat.CONSUMED;
+                      });
+                      ViewCompat.requestApplyInsets(root);
+                  } catch (Throwable ignored) { }
+              }
               private void applyFullscreen() {
                   try {
                       Window w = getWindow();
@@ -1314,6 +1373,7 @@ jobs:
                   bg = false;
                   stoppedNow = false;
                   suppressHide = false;
+                  startUpdateWatch();
                   if (hideOnReturn) {
                       hideOnReturn = false;
                       // Site (yalnizca 3828 ile girildiyse) ekrani gizler ve donuste PIN sorar
@@ -1326,6 +1386,7 @@ jobs:
                   super.onStop();
                   bg = true;
                   stoppedNow = true;
+                  stopUpdateWatch();
                   keepAlive();
                   if (!suppressHide) {
                       hideOnReturn = true;
