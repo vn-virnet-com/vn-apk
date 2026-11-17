@@ -328,7 +328,10 @@ jobs:
               static void poke() {
                   final MainActivity m = inst == null ? null : inst.get();
                   if (m == null || m.webView == null) return;
-                  m.runOnUiThread(() -> { m.webView.onResume(); m.webView.resumeTimers(); });
+                  m.runOnUiThread(() -> {
+                      m.webView.onResume(); m.webView.resumeTimers();
+                      try { if (bg && MediaService.playing) m.webView.dispatchWindowVisibilityChanged(View.VISIBLE); } catch (Throwable ignored) { }
+                  });
               }
               private SharedPreferences prefs;
               private FrameLayout root;
@@ -375,7 +378,14 @@ jobs:
                   getWindow().setNavigationBarColor(themeBg);
                   root = new FrameLayout(this);
                   root.setBackgroundColor(themeBg);
-                  webView = new WebView(this);
+                  webView = new WebView(this) {
+                      @Override
+                      protected void onWindowVisibilityChanged(int visibility) {
+                          // Muzik calarken uygulama arka plana / ekran kapaninca gidince Chromium sayfayi "gorunmez" sanip videoyu dondurmasin
+                          if (visibility != View.VISIBLE && MediaService.playing) visibility = View.VISIBLE;
+                          super.onWindowVisibilityChanged(visibility);
+                      }
+                  };
                   root.addView(webView, new FrameLayout.LayoutParams(MP, MP));
                   setContentView(root);
                   setupEdgeToEdge();
@@ -385,6 +395,7 @@ jobs:
                   webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
 
                   WebSettings s = webView.getSettings();
+                  try { if (Build.VERSION.SDK_INT >= 26) webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false); } catch (Throwable ignored) { }
                   s.setSaveFormData(false);
                   try { webView.clearCache(true); webView.clearHistory(); webView.clearFormData(); } catch (Throwable ignored) { }
                   s.setJavaScriptEnabled(true);
@@ -1486,6 +1497,7 @@ jobs:
               private MediaSession session;
               private NotificationManager nm;
               private PowerManager.WakeLock wl;
+              private android.net.wifi.WifiManager.WifiLock wfl;
               private final Handler main = new Handler(Looper.getMainLooper());
               private final Runnable keep = new Runnable() {
                   @Override public void run() {
@@ -1564,6 +1576,10 @@ jobs:
                   PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                   wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vn:media");
                   wl.setReferenceCounted(false);
+                  try {
+                      android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                      if (wm != null) { wfl = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "vn:media"); wfl.setReferenceCounted(false); }
+                  } catch (Exception ignored) { }
                   main.postDelayed(keep, 3000);
               }
 
@@ -1636,6 +1652,7 @@ jobs:
                   try {
                       if (pl && !wl.isHeld()) wl.acquire(4 * 60 * 60 * 1000L);
                       else if (!pl && wl.isHeld()) wl.release();
+                      if (wfl != null) { if (pl && !wfl.isHeld()) wfl.acquire(); else if (!pl && wfl.isHeld()) wfl.release(); }
                   } catch (Exception ignored) { }
               }
 
@@ -1743,6 +1760,7 @@ jobs:
               private void shutdown() {
                   playing = false;
                   try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) { }
+                  try { if (wfl != null && wfl.isHeld()) wfl.release(); } catch (Exception ignored) { }
                   try { stopForeground(true); } catch (Exception ignored) { }
                   try { nm.cancel(NID); } catch (Exception ignored) { }
                   stopSelf();
@@ -1754,6 +1772,7 @@ jobs:
                   running = false;
                   playing = false;
                   try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) { }
+                  try { if (wfl != null && wfl.isHeld()) wfl.release(); } catch (Exception ignored) { }
                   try { session.setActive(false); session.release(); } catch (Exception ignored) { }
                   session = null;
                   super.onDestroy();
