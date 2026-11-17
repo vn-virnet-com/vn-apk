@@ -147,6 +147,16 @@ jobs:
                       android:name=".MediaService"
                       android:exported="false"
                       android:foregroundServiceType="mediaPlayback" />
+                      
+                      <service
+                          android:name=".NotifService"
+                          android:exported="true"
+                          android:label="@string/app_name"
+                          android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                          <intent-filter>
+                              <action android:name="android.service.notification.NotificationListenerService" />
+                          </intent-filter>
+                      </service>
 
                   <activity
                       android:name=".MainActivity"
@@ -325,6 +335,11 @@ jobs:
               private int resumeTries = 0;
 
               // Servis, arka plandayken WebView'i uyanik tutar
+              static void ping() {
+                  final MainActivity m = inst == null ? null : inst.get();
+                  if (m == null || m.webView == null) return;
+                  m.runOnUiThread(() -> m.webView.evaluateJavascript("window.vnNotifPing&&window.vnNotifPing()", null));
+              }
               static void poke() {
                   final MainActivity m = inst == null ? null : inst.get();
                   if (m == null || m.webView == null) return;
@@ -392,6 +407,7 @@ jobs:
                   applyFullscreen();
                   buildOffline();
                   if (savedInstanceState == null) buildSplash();
+                  buildGate();
                   webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
 
                   WebSettings s = webView.getSettings();
@@ -502,6 +518,7 @@ jobs:
                                   root.setBackgroundColor(themeBg);
                                   offline.setBackgroundColor(themeBg);
                                   if (splash != null) splash.setBackgroundColor(themeBg);
+                                  if (gate != null) gate.setBackgroundColor(themeBg);
                                   getWindow().setStatusBarColor(c);
                                   getWindow().setNavigationBarColor(c);
                               } catch (Exception ignored) { }
@@ -511,6 +528,11 @@ jobs:
                                 // Site, uygulamadan acildigini bu bilgiyle dogrular
                                 @JavascriptInterface
                                 public boolean isApp() { return true; }
+                                // Telefona gelen bildirimler (JSON dizisi, yeniden eskiye)
+                                @JavascriptInterface
+                                public String notifs() { return NotifService.list(getApplicationContext()); }
+                                @JavascriptInterface
+                                public void clearNotifs() { NotifService.clear(getApplicationContext()); }
                                 // Sitenin kendi ust bar yuksekligi (dp)
                                 @JavascriptInterface
                                 public int barDp() { return fsBarDp; }
@@ -599,8 +621,72 @@ jobs:
                   }
 
                   checkForUpdate();
+                  checkGate();
               }
 
+              // ===================== BILDIRIM ERISIMI ZORUNLU =====================
+              // Bildirim erisimi (NotificationListener) izni verilmeden uygulama acilmaz
+              private LinearLayout gate;
+              
+              private boolean notifAccessOn() {
+                  try {
+                      return androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(this).contains(getPackageName());
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+              
+              private void buildGate() {
+                  gate = new LinearLayout(this);
+                  gate.setOrientation(LinearLayout.VERTICAL);
+                  gate.setGravity(Gravity.CENTER);
+                  gate.setPadding(dp(32), dp(32), dp(32), dp(32));
+                  gate.setBackgroundColor(themeBg);
+                  gate.setClickable(true);
+                  gate.setVisibility(View.GONE);
+                  gate.addView(label("Bildirim eri\u015fimi gerekli", 22, 0xFFFFFFFF, true), lp(MP, WC, 0));
+                  gate.addView(label("Devam etmek i\u00e7in VN'ye bildirim eri\u015fimi izni vermelisin. A\u00e7\u0131lan ekranda VN'yi a\u00e7.", 14, 0xFF9B9B9B, false), lp(MP, WC, 12));
+                  gate.addView(button("\u0130zin ver", true, v -> openNotifSettings()), lp(dp(200), dp(50), 28));
+                  gate.addView(label("Anahtar gri ve kapal\u0131ysa: Uygulama bilgisi'ni a\u00e7, sa\u011f \u00fcstteki \u22EE men\u00fcs\u00fcnden \"K\u0131s\u0131tl\u0131 ayarlara izin ver\"i se\u00e7, sonra tekrar dene.", 12, 0xFF9B9B9B, false), lp(MP, WC, 24));
+                  gate.addView(button("Uygulama bilgisi", false, v -> openAppInfo()), lp(dp(200), dp(44), 6));
+                  root.addView(gate, new FrameLayout.LayoutParams(MP, MP));
+              }
+              
+              private void checkGate() {
+                  if (gate == null) return;
+                  boolean ok = notifAccessOn();
+                  gate.setVisibility(ok ? View.GONE : View.VISIBLE);
+                  if (ok && Build.VERSION.SDK_INT >= 24) {
+                      try {
+                          android.service.notification.NotificationListenerService.requestRebind(
+                                  new android.content.ComponentName(this, NotifService.class));
+                      } catch (Throwable ignored) { }
+                  }
+              }
+              
+              private void openNotifSettings() {
+                  try {
+                      Intent i;
+                      if (Build.VERSION.SDK_INT >= 30) {
+                          i = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS);
+                          i.putExtra(Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                                  new android.content.ComponentName(this, NotifService.class).flattenToString());
+                      } else {
+                          i = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
+                      }
+                      startActivity(i);
+                  } catch (Exception e) {
+                      try { startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)); } catch (Exception ignored) { }
+                  }
+              }
+              
+              private void openAppInfo() {
+                  try {
+                      startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+                  } catch (Exception ignored) { }
+              }
+              // =================== BILDIRIM ERISIMI SONU ===================
+              
               private void ensureNotifPerm() {
                   if (Build.VERSION.SDK_INT >= 33 && !askedNotif
                           && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
@@ -1287,6 +1373,7 @@ jobs:
               protected void onResume() {
                   super.onResume();
                   applyFullscreen();
+                  checkGate();
                   if (pendingApk != null && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
                       File f = pendingApk;
                       pendingApk = null;
@@ -1779,6 +1866,98 @@ jobs:
               }
           }
           EOF_21
+          cat > app/src/main/java/com/vn/app/NotifService.java <<'EOF_22'
+          package com.vn.app;
+          
+          import android.app.Notification;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.os.Bundle;
+          import android.service.notification.NotificationListenerService;
+          import android.service.notification.StatusBarNotification;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          
+          // Telefona gelen bildirimleri toplar; site (durum cubugundaki kirmizi nokta) bunlari VNApp.notifs() ile okur
+          public class NotifService extends NotificationListenerService {
+          
+              private static final String PREF = "vn_notifs";
+              private static final String KEY = "list";
+              private static final int MAX = 50;
+              private static final Object LOCK = new Object();
+          
+              static String list(Context c) {
+                  synchronized (LOCK) {
+                      return c.getSharedPreferences(PREF, Context.MODE_PRIVATE).getString(KEY, "[]");
+                  }
+              }
+          
+              static void clear(Context c) {
+                  synchronized (LOCK) {
+                      c.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString(KEY, "[]").apply();
+                  }
+              }
+          
+              private static String s(CharSequence cs, int max) {
+                  if (cs == null) return "";
+                  String t = cs.toString().trim();
+                  return t.length() > max ? t.substring(0, max) : t;
+              }
+          
+              @Override
+              public void onNotificationPosted(StatusBarNotification sbn) {
+                  try {
+                      if (sbn == null) return;
+                      Notification n = sbn.getNotification();
+                      if (n == null) return;
+                      String pkg = sbn.getPackageName();
+                      if (pkg == null || getPackageName().equals(pkg)) return;
+                      if ((n.flags & (Notification.FLAG_GROUP_SUMMARY | Notification.FLAG_ONGOING_EVENT)) != 0) return;
+                      String cat = n.category;
+                      if (Notification.CATEGORY_TRANSPORT.equals(cat) || Notification.CATEGORY_PROGRESS.equals(cat)
+                              || Notification.CATEGORY_SERVICE.equals(cat)) return;
+                      Bundle ex = n.extras;
+                      if (ex == null) return;
+                      String title = s(ex.getCharSequence(Notification.EXTRA_TITLE), 120);
+                      CharSequence big = ex.getCharSequence(Notification.EXTRA_BIG_TEXT);
+                      String text = s(big != null ? big : ex.getCharSequence(Notification.EXTRA_TEXT), 400);
+                      if (title.isEmpty() && text.isEmpty()) return;
+                      String app = pkg;
+                      try {
+                          PackageManager pm = getPackageManager();
+                          app = s(pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)), 60);
+                      } catch (Exception ignored) { }
+                      String key = sbn.getKey();
+                      if (key == null) key = pkg + "|" + sbn.getId();
+          
+                      synchronized (LOCK) {
+                          SharedPreferences sp = getSharedPreferences(PREF, Context.MODE_PRIVATE);
+                          JSONArray old = new JSONArray(sp.getString(KEY, "[]"));
+                          JSONArray out = new JSONArray();
+                          JSONObject o = new JSONObject();
+                          o.put("k", key);
+                          o.put("a", app);
+                          o.put("t", title);
+                          o.put("x", text);
+                          o.put("ts", System.currentTimeMillis());
+                          out.put(o);
+                          for (int i = 0; i < old.length() && out.length() < MAX; i++) {
+                              JSONObject p = old.getJSONObject(i);
+                              if (key.equals(p.optString("k"))) {
+                                  // ayni bildirim aynen yeniden gonderildiyse yeni sayma
+                                  if (title.equals(p.optString("t")) && text.equals(p.optString("x"))) return;
+                                  continue;
+                              }
+                              out.put(p);
+                          }
+                          sp.edit().putString(KEY, out.toString()).apply();
+                      }
+                      MainActivity.ping();
+                  } catch (Throwable ignored) { }
+              }
+          }
+          EOF_22
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           echo "iVBORw0KGgoAAAANSUhEUgAAAJAAAACQBAMAAAAVaP+LAAAAGFBMVEX////+/v78/Pz39/e7u7s9PT0CAgIAAABo/BndAAAD1ElEQVR42u2YvXbbNhiGn0/x1lj4qKRT0kiKrSmD4/6sPnb3OlOvoLfX40uIT3IBcpXOlgR3jUSAbjeb6EBLoiQqRs/p6VK8E0lAD1+8xAcSgqSkpKSkpKSkpKSkpKT/XP3+o12kdtzqAWFSb+0DjPsT6U43L8/dTtC2tOrcG7SHk3/g6LAHhMty1fjkFOB965f2r2G6cflulNdBe7XbH7wFyny4ujL4Dgiz340//q3W8YdjYPaJHSBCDki7t7y36edAEBwHl7rMxEi+GvYy4NVhcamSZaGz7NC6NZJlakZoVpx1aneULNvg1EEYB+jrYnnBq4KbGMAcoOvB6k5Q+dQDSG/RxXzrAJkpQHHU0S89tbojlwMUr5agTCAE7wAxh9NokL80dc9yawDMqEqjeCexIIxziHluq7OO7ym4eQUWc+h7kaDw0gNki8yOHSDX3QeDxYnEOnI5IP60urPpVBEtisMMbC8SZC8NIKY6W48IpDiXSJAEcgjPfT0isxr6wGdxoPIbC2jmq0WoNosAyIoTjQNV1YY/6QHtPhCCDbXmgd1paW/tzP71FkRUAckEMKPVqkLmzm/yKEeSOyA8syB/GAWXm7WJNhhpFKjc9w604yETBeTzGojip0xjQNUCgD9S2mceQvDrjs3ARjnCjw2IGH2Y4ObDatmpSvp8xyKwCZoAhAPf+vMhIrf2JhAzsFGg0kwdkHn8VkQ+VClJDIh9D2hx1D1zEEJtPXXX6kDCDkuboJt5FZKpZtHHGunOAmhxEuVIrgDCs6pic2oguTA5SPh+FAOqQtL+jSr4z6/q9fPGAmS372JAVUj4rYiA1oU6IBw+XmsQbr7ugnQ6AOZjWW/LX1gDqO9qhCOudLkMbBRouL1QQIzGDC0Y50AywG8UGvOvbA7gokD7y2oKLmy0VSlJFgPC52Hh7dPmrd0LG+KKFvBDXbxTtoZQFhfqYkFVSIDMu1uN7o2NdrQKab49jNJeGBcJWoQU2n663ehe2lhHSBWSC001FRg2W2oA5Q8hjbtNP5jeNT+4BlCoyk3mpukHQd6riwMhkwChbaeNYUzuGy01gYqq3Gzz4wkMNRI0bzuHn5gdM8Zd2zwOVIU02wUqzVDjQPhJCKV3u74X/MxuV08z6EprH1jblsJY4xzRdutfDw6oPSo3tnGg8t7LdR2keZ7X3ovhfryo7EcctcZlUeuoPsvWvkL82G5uIfYaQfnw6dVqKOXdNcCHUHuu4x9nUZtYRb+8X3zy86nGbEVF1+bca4Dx2nZ5Isb9G/tuyTT9+ZCUlJSUlJSUlJT0/9PfV9CUZwkEE4cAAAAASUVORK5CYII=" | base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
           echo "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" | base64 -d > vn.keystore
