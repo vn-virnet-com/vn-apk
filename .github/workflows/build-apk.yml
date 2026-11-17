@@ -117,6 +117,8 @@ jobs:
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
               <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
               <queries>
@@ -579,7 +581,7 @@ jobs:
                                                 net = "other";
                                             }
                                         }
-                                        return "{\"bat\":" + bat + ",\"chg\":" + chg + ",\"net\":\"" + net + "\",\"lvl\":" + lvl + "}";
+                                        return "{\"bat\":" + bat + ",\"chg\":" + chg + ",\"net\":\"" + net + "\",\"lvl\":" + lvl + ",\"bt\":" + btHeadset() + "}";
                                     } catch (Throwable t) {
                                         return "{}";
                                     }
@@ -932,6 +934,83 @@ jobs:
                   }
               }
 
+              // ===================== IZINLER (acilista hepsi istenir; Yakindaki cihazlar ZORUNLU) =====================
+              private static final int NEARBY_REQ = 6;
+              private static final int ALL_REQ = 7;
+              private boolean permsAsked = false;
+              private boolean permBusy = false;
+              private android.app.AlertDialog nearbyDlg;
+
+              private boolean hasNearby() {
+                  return Build.VERSION.SDK_INT < 31
+                          || checkSelfPermission("android.permission.BLUETOOTH_CONNECT") == PackageManager.PERMISSION_GRANTED;
+              }
+
+              // Bluetooth kulaklik (A2DP / SCO / BLE) bagli mi?
+              private boolean btHeadset() {
+                  try {
+                      android.media.AudioManager am = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                      if (am == null) return false;
+                      for (android.media.AudioDeviceInfo d : am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)) {
+                          int t = d.getType();
+                          if (t == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || t == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return true;
+                          if (Build.VERSION.SDK_INT >= 31 && t == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET) return true;
+                      }
+                  } catch (Throwable ignored) { }
+                  return false;
+              }
+
+              // Sitenin ihtiyaci olan tum izinler: mikrofon, bildirim, yakindaki cihazlar
+              private void askAllPerms() {
+                  if (Build.VERSION.SDK_INT < 23) return;
+                  java.util.ArrayList<String> need = new java.util.ArrayList<>();
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) need.add(Manifest.permission.RECORD_AUDIO);
+                  if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                      need.add("android.permission.POST_NOTIFICATIONS");
+                      askedNotif = true;
+                  }
+                  if (!hasNearby()) {
+                      need.add("android.permission.BLUETOOTH_CONNECT");
+                      prefs.edit().putBoolean("nearbyAsked", true).apply();
+                  }
+                  if (need.isEmpty()) return;
+                  permBusy = true;
+                  requestPermissions(need.toArray(new String[0]), ALL_REQ);
+              }
+
+              // Yakindaki cihazlar izni verilene kadar kapatilamayan pencere: once izin ister, kalici reddedildiyse Ayarlar'a gonderir
+              private void enforceNearby() {
+                  if (hasNearby()) {
+                      if (nearbyDlg != null) { try { nearbyDlg.dismiss(); } catch (Throwable ignored) { } nearbyDlg = null; }
+                      return;
+                  }
+                  if (permBusy || isFinishing()) return;
+                  if (nearbyDlg != null && nearbyDlg.isShowing()) return;
+                  final boolean blocked = prefs.getBoolean("nearbyAsked", false)
+                          && !shouldShowRequestPermissionRationale("android.permission.BLUETOOTH_CONNECT");
+                  android.app.AlertDialog.Builder b = new android.app.AlertDialog.Builder(this);
+                  b.setCancelable(false);
+                  b.setTitle("Yakındaki cihazlar izni gerekli");
+                  b.setMessage(blocked
+                          ? "Uygulamanın çalışması için Yakındaki cihazlar iznini Ayarlar'dan açman gerekiyor."
+                          : "Uygulamanın çalışması için Yakındaki cihazlar izni zorunlu.");
+                  b.setPositiveButton(blocked ? "Ayarları aç" : "İzin ver", (dlg, which) -> {
+                      nearbyDlg = null;
+                      if (blocked) {
+                          try {
+                              startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+                          } catch (Exception ignored) { }
+                      } else {
+                          prefs.edit().putBoolean("nearbyAsked", true).apply();
+                          permBusy = true;
+                          requestPermissions(new String[]{"android.permission.BLUETOOTH_CONNECT"}, NEARBY_REQ);
+                      }
+                  });
+                  nearbyDlg = b.create();
+                  nearbyDlg.show();
+              }
+              // =================== IZINLER SONU ===================
+
               // Sitenin mikrofon istegi (sesli mesaj): once Android iznini iste, sonra siteye ver
               private void handleWebPermission(PermissionRequest request) {
                   boolean wantsAudio = false;
@@ -955,6 +1034,11 @@ jobs:
               @Override
               public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == ALL_REQ || requestCode == NEARBY_REQ) {
+                      permBusy = false;
+                      new Handler(Looper.getMainLooper()).post(this::enforceNearby);
+                      return;
+                  }
                   if (requestCode == PERM_REQ && pendingPerm != null) {
                       boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
                       if (ok) {
@@ -1374,6 +1458,8 @@ jobs:
                   super.onResume();
                   applyFullscreen();
                   checkGate();
+                  if (!permsAsked) { permsAsked = true; askAllPerms(); }
+                  enforceNearby();
                   if (pendingApk != null && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
                       File f = pendingApk;
                       pendingApk = null;
