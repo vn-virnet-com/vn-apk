@@ -108,6 +108,7 @@ jobs:
 
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
               <uses-permission android:name="android.permission.VIBRATE" />
@@ -282,6 +283,17 @@ jobs:
           import java.net.URL;
           import org.json.JSONArray;
           import org.json.JSONObject;
+          import android.content.IntentFilter;
+          import android.os.BatteryManager;
+          import android.net.NetworkCapabilities;
+          import android.net.wifi.WifiInfo;
+          import android.net.wifi.WifiManager;
+          import android.telephony.SignalStrength;
+          import android.telephony.TelephonyManager;
+          import android.view.WindowInsets;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
 
           public class MainActivity extends Activity {
 
@@ -360,6 +372,7 @@ jobs:
                   webView = new WebView(this);
                   root.addView(webView, new FrameLayout.LayoutParams(MP, MP));
                   setContentView(root);
+                  applyFullscreen();
                   buildOffline();
                   if (savedInstanceState == null) buildSplash();
                   webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
@@ -480,6 +493,57 @@ jobs:
                                 // Site, uygulamadan acildigini bu bilgiyle dogrular
                                 @JavascriptInterface
                                 public boolean isApp() { return true; }
+                                // Sitenin kendi ust bar yuksekligi (dp)
+                                @JavascriptInterface
+                                public int barDp() { return fsBarDp; }
+
+                                // Pil + ag durumu (JSON): {"bat":73,"chg":false,"net":"wifi|cell|eth|other|none","lvl":0-4 veya -1}
+                                @JavascriptInterface
+                                public String sys() {
+                                    try {
+                                        int bat = -1;
+                                        boolean chg = false;
+                                        Intent b = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+                                        if (b != null) {
+                                            int l = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                                            int sc = b.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                                            if (l >= 0 && sc > 0) bat = l * 100 / sc;
+                                            int st = b.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                                            chg = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+                                        }
+                                        String net = "none";
+                                        int lvl = -1;
+                                        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+                                        Network n = cm.getActiveNetwork();
+                                        NetworkCapabilities nc = n == null ? null : cm.getNetworkCapabilities(n);
+                                        if (nc != null) {
+                                            if (nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                                                net = "wifi";
+                                                try {
+                                                    WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                                                    WifiInfo wi = wm == null ? null : wm.getConnectionInfo();
+                                                    if (wi != null && wi.getRssi() > -127) lvl = WifiManager.calculateSignalLevel(wi.getRssi(), 5);
+                                                } catch (Throwable ignored) { }
+                                            } else if (nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                                                net = "cell";
+                                                if (Build.VERSION.SDK_INT >= 28) {
+                                                    try {
+                                                        TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
+                                                        SignalStrength ss = tm == null ? null : tm.getSignalStrength();
+                                                        if (ss != null) lvl = ss.getLevel();
+                                                    } catch (Throwable ignored) { }
+                                                }
+                                            } else if (nc.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                                                net = "eth";
+                                            } else {
+                                                net = "other";
+                                            }
+                                        }
+                                        return "{\"bat\":" + bat + ",\"chg\":" + chg + ",\"net\":\"" + net + "\",\"lvl\":" + lvl + "}";
+                                    } catch (Throwable t) {
+                                        return "{}";
+                                    }
+                                }
 
                                 // Siteden gelen sarki bilgisi -> bildirim paneli (kapak, sure, ileri/geri)
                                 @JavascriptInterface
@@ -1181,17 +1245,87 @@ jobs:
                   }
               }
 
+              // ===================== TAM EKRAN (kendi ust bar) =====================
+              // true yapilirsa alttaki gezinme cubugu da gizlenir (kaydirinca gecici gorunur)
+              private static final boolean HIDE_NAV_BAR = false;
+              private volatile int fsBarDp = 0;
+
+              private void applyFullscreen() {
+                  try {
+                      Window w = getWindow();
+                      if (Build.VERSION.SDK_INT >= 28) {
+                          WindowManager.LayoutParams lp = w.getAttributes();
+                          lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                          w.setAttributes(lp);
+                      }
+                      WindowInsetsControllerCompat c = WindowCompat.getInsetsController(w, w.getDecorView());
+                      c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                      int types = WindowInsetsCompat.Type.statusBars();
+                      if (HIDE_NAV_BAR) types |= WindowInsetsCompat.Type.navigationBars();
+                      c.hide(types);
+
+                      // Sitenin kendi ust barinin yuksekligi = sistem durum cubugu (veya ekran girintisi / notch) yuksekligi
+                      float d = getResources().getDisplayMetrics().density;
+                      int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+                      int px = id > 0 ? getResources().getDimensionPixelSize(id) : Math.round(24 * d);
+                      if (Build.VERSION.SDK_INT >= 28) {
+                          WindowInsets wi = w.getDecorView().getRootWindowInsets();
+                          if (wi != null && wi.getDisplayCutout() != null) {
+                              px = Math.max(px, wi.getDisplayCutout().getSafeInsetTop());
+                          }
+                      }
+                      fsBarDp = Math.round(px / d);
+                  } catch (Throwable ignored) { }
+              }
+
+              @Override
+              public void onWindowFocusChanged(boolean hasFocus) {
+                  super.onWindowFocusChanged(hasFocus);
+                  if (hasFocus) applyFullscreen(); // klavye / bildirim cekmecesi sonrasi barlar yeniden gizlensin
+              }
+
+              // ===================== ARKA PLANA GIDINCE GIZLE (3828 PIN'i) =====================
+              // Galeri / kamera / harici uygulama acarken (geri donulecek) gizleme yapma
+              private boolean suppressHide = false;
+              private boolean hideOnReturn = false;
+              private boolean stoppedNow = false;
+              private final Handler fgH = new Handler(Looper.getMainLooper());
+
+              @Override
+              public void startActivityForResult(Intent intent, int requestCode, Bundle options) {
+                  suppressHide = true;
+                  // Acma basarisiz olursa (activity hic durmazsa) bayrak takili kalmasin
+                  fgH.postDelayed(() -> { if (!stoppedNow) suppressHide = false; }, 2000);
+                  super.startActivityForResult(intent, requestCode, options);
+              }
+
+              private void evalJs(String js) {
+                  try { if (webView != null) webView.evaluateJavascript(js, null); } catch (Throwable ignored) { }
+              }
+
               @Override
               protected void onStart() {
                   super.onStart();
                   bg = false;
+                  stoppedNow = false;
+                  suppressHide = false;
+                  if (hideOnReturn) {
+                      hideOnReturn = false;
+                      // Site (yalnizca 3828 ile girildiyse) ekrani gizler ve donuste PIN sorar
+                      evalJs("window.__vnBg&&window.__vnBg();window.__vnFg&&window.__vnFg()");
+                  }
               }
 
               @Override
               protected void onStop() {
                   super.onStop();
                   bg = true;
+                  stoppedNow = true;
                   keepAlive();
+                  if (!suppressHide) {
+                      hideOnReturn = true;
+                      evalJs("window.__vnBg&&window.__vnBg()");
+                  }
               }
 
               @Override
