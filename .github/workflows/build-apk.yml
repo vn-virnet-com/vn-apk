@@ -164,7 +164,7 @@ jobs:
                       android:name=".MainActivity"
                       android:exported="true"
                       android:launchMode="singleTask"
-                      android:configChanges="orientation|screenSize|keyboard|keyboardHidden|smallestScreenSize|screenLayout|uiMode"
+                      android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|touchscreen|smallestScreenSize|screenLayout|uiMode|density|fontScale|layoutDirection|locale|colorMode|mcc|mnc"
                       android:windowSoftInputMode="adjustResize">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
