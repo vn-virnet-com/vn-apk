@@ -115,6 +115,8 @@ jobs:
               <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
@@ -149,7 +151,13 @@ jobs:
                       android:name=".MediaService"
                       android:exported="false"
                       android:foregroundServiceType="mediaPlayback" />
-                      
+
+                  <service
+                      android:name=".BackgroundService"
+                      android:exported="false"
+                      android:stopWithTask="false"
+                      android:foregroundServiceType="remoteMessaging" />
+
                       <service
                           android:name=".NotifService"
                           android:exported="true"
@@ -301,6 +309,9 @@ jobs:
           import org.json.JSONObject;
           import android.content.IntentFilter;
           import android.os.BatteryManager;
+          import android.content.MutableContextWrapper;
+          import android.os.PowerManager;
+          import android.view.inputmethod.InputMethodManager;
           import android.net.NetworkCapabilities;
           import android.net.wifi.WifiInfo;
           import android.net.wifi.WifiManager;
@@ -332,24 +343,59 @@ jobs:
 
               static WeakReference<MainActivity> inst;
               static volatile boolean bg = false;
-              private boolean wasPlaying = false;
-              private long lastResume = 0;
-              private int resumeTries = 0;
+              static final Handler UI = new Handler(Looper.getMainLooper());
+
+              // WebView (ve icindeki PeerJS) activity'den bagimsiz yasar: activity kapansa da yok edilmez, tekrar acilinca ayni WebView'e baglanir
+              static WebView sWeb;
+              static MutableContextWrapper sCtx;
+              static Context sApp;
+              static volatile boolean sAttached = false;
+              static volatile boolean loadFailed = false;
+              static volatile int fsBarDp = 0;
+              static boolean wasPlaying = false;
+              static long lastResume = 0;
+              static int resumeTries = 0;
+              static boolean hideOnReturn = false;
+              private static long lastSvcRetry = 0;
+
+              static MainActivity cur() { return inst == null ? null : inst.get(); }
 
               // Servis, arka plandayken WebView'i uyanik tutar
               static void ping() {
-                  final MainActivity m = inst == null ? null : inst.get();
-                  if (m == null || m.webView == null) return;
-                  m.runOnUiThread(() -> m.webView.evaluateJavascript("window.vnNotifPing&&window.vnNotifPing()", null));
+                  final WebView w = sWeb;
+                  if (w == null) return;
+                  UI.post(() -> w.evaluateJavascript("window.vnNotifPing&&window.vnNotifPing()", null));
               }
               static void poke() {
-                  final MainActivity m = inst == null ? null : inst.get();
-                  if (m == null || m.webView == null) return;
-                  m.runOnUiThread(() -> {
-                      m.webView.onResume(); m.webView.resumeTimers();
-                      try { if (bg && MediaService.playing) m.webView.dispatchWindowVisibilityChanged(View.VISIBLE); } catch (Throwable ignored) { }
+                  final WebView w = sWeb;
+                  if (w == null) return;
+                  UI.post(() -> {
+                      try { w.onResume(); w.resumeTimers(); } catch (Throwable ignored) { }
+                      try {
+                          if ((!sAttached || bg) && (MediaService.playing || BackgroundService.running))
+                              w.dispatchWindowVisibilityChanged(View.VISIBLE);
+                      } catch (Throwable ignored) { }
                   });
               }
+
+              // Servis, process olduruldugunda yeniden baslarsa (activity yokken) siteyi arka planda yukler: PeerJS tekrar baglanir
+              static void ensureWebForService(Context app) {
+                  if (sWeb != null) return;
+                  sApp = app.getApplicationContext();
+                  bg = true;
+                  obtainWeb(sApp).loadUrl(SITE_URL);
+              }
+
+              // Activity yokken ilk yukleme basarisiz olduysa (ag yoktu) servis araliklarla yeniden dener
+              static void serviceRetry() {
+                  final WebView w = sWeb;
+                  if (w == null || sAttached || !loadFailed) return;
+                  long now = System.currentTimeMillis();
+                  if (now - lastSvcRetry < 15000) return;
+                  lastSvcRetry = now;
+                  UI.post(() -> { loadFailed = false; try { w.loadUrl(SITE_URL); } catch (Throwable ignored) { } });
+              }
+
               private SharedPreferences prefs;
               private FrameLayout root;
               // ===== ACILIS EKRANI (splash) =====
@@ -359,7 +405,6 @@ jobs:
               private boolean splAnimDone = false, splPageReady = false, splEntryReady = false, splGone = false;
               private LinearLayout offline;
               private TextView offBtn;
-              private boolean loadFailed = false;
               private boolean askedNotif = false;
               private ConnectivityManager.NetworkCallback netCb;
 
@@ -373,9 +418,9 @@ jobs:
 
               // Siteden medya komutu (bildirim paneli / kulaklik) gonderir
               static boolean cmd(final String a, final double v) {
-                  final MainActivity m = inst == null ? null : inst.get();
-                  if (m == null || m.webView == null) return false;
-                  m.runOnUiThread(() -> m.webView.evaluateJavascript(
+                  final WebView w = sWeb;
+                  if (w == null) return false;
+                  UI.post(() -> w.evaluateJavascript(
                           "window.vnMedia&&window.vnMedia('" + a + "'," + v + ")", null));
                   return true;
               }
@@ -395,27 +440,63 @@ jobs:
                   getWindow().setNavigationBarColor(themeBg);
                   root = new FrameLayout(this);
                   root.setBackgroundColor(themeBg);
-                  webView = new WebView(this) {
-                      @Override
-                      protected void onWindowVisibilityChanged(int visibility) {
-                          // Muzik calarken uygulama arka plana / ekran kapaninca gidince Chromium sayfayi "gorunmez" sanip videoyu dondurmasin
-                          if (visibility != View.VISIBLE && MediaService.playing) visibility = View.VISIBLE;
-                          super.onWindowVisibilityChanged(visibility);
-                      }
-                  };
-                  root.addView(webView, new FrameLayout.LayoutParams(MP, MP));
+                  sApp = getApplicationContext();
+                  final boolean freshWeb = (sWeb == null);
+                  webView = obtainWeb(sApp);
+                  attachWeb();
                   setContentView(root);
                   setupEdgeToEdge();
                   applyFullscreen();
                   buildOffline();
                   if (savedInstanceState == null) buildSplash();
+                  buildBattGate();
                   buildGate();
                   webView.setVisibility(View.INVISIBLE); // guncelleme kontrolu bitene kadar site gizli
 
-                  WebSettings s = webView.getSettings();
-                  try { if (Build.VERSION.SDK_INT >= 26) webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false); } catch (Throwable ignored) { }
+                  if (freshWeb) {
+                      if (savedInstanceState != null) {
+                          webView.restoreState(savedInstanceState);
+                      } else {
+                          webView.loadUrl(SITE_URL);
+                      }
+                  } else {
+                      // WebView zaten yasiyor (PeerJS acik): yeniden yukleme YOK, ayni sayfaya baglanilir
+                      splPageReady = true; splTry();
+                      if (loadFailed) showOffline();
+                      // Uygulama tamamen kapatilip acildiysa eskiden oldugu gibi PIN yeniden sorulsun
+                      if (savedInstanceState == null) evalJs("window.__vnReopen&&window.__vnReopen()");
+                  }
+
+                  BackgroundService.start(this);
+                  checkForUpdate();
+                  checkGate();
+                  checkBattGate();
+                  handleOpenIntent(getIntent());
+              }
+
+              // ===================== KALICI WEBVIEW =====================
+              static class VnWebView extends WebView {
+                  VnWebView(Context c) { super(c); }
+                  @Override
+                  protected void onWindowVisibilityChanged(int visibility) {
+                      // Muzik calarken ya da arka plan servisi calisirken uygulama arka plana / ekran kapaninca gidince
+                      // Chromium sayfayi "gorunmez" sanip zamanlayicilari / videoyu dondurmasin
+                      if (visibility != View.VISIBLE && (MediaService.playing || BackgroundService.running)) visibility = View.VISIBLE;
+                      super.onWindowVisibilityChanged(visibility);
+                  }
+              }
+
+              // WebView'i bir kez olusturur (application baglami + MutableContextWrapper); sonra activity'ler buna baglanir
+              private static WebView obtainWeb(Context app) {
+                  if (sWeb != null) return sWeb;
+                  sCtx = new MutableContextWrapper(app);
+                  final WebView w = new VnWebView(sCtx);
+                  sWeb = w;
+
+                  WebSettings s = w.getSettings();
+                  try { if (Build.VERSION.SDK_INT >= 26) w.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false); } catch (Throwable ignored) { }
                   s.setSaveFormData(false);
-                  try { webView.clearCache(true); webView.clearHistory(); webView.clearFormData(); } catch (Throwable ignored) { }
+                  try { w.clearCache(true); w.clearHistory(); w.clearFormData(); } catch (Throwable ignored) { }
                   s.setJavaScriptEnabled(true);
                   s.setUserAgentString(s.getUserAgentString() + " VNApp/1");
                   s.setDomStorageEnabled(true);
@@ -429,207 +510,344 @@ jobs:
                       if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                           Set<String> origins = new HashSet<>(Arrays.asList(
                                   "https://www.youtube.com", "https://youtube.com", "https://*.youtube.com", "https://www.youtube-nocookie.com"));
-                          WebViewCompat.addDocumentStartJavaScript(webView, KEEP_JS, origins);
+                          WebViewCompat.addDocumentStartJavaScript(w, KEEP_JS, origins);
                       }
                   } catch (Throwable ignored) { }
 
                   CookieManager.getInstance().setAcceptCookie(true);
-                  CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
 
-                  webView.setWebViewClient(new WebViewClient() {
-                                @Override
-                                public void onPageStarted(WebView view, String url, android.graphics.Bitmap icon) {
-                                    loadFailed = false;
-                                }
+                  w.setWebViewClient(new VnClient());
+                  w.setWebChromeClient(new VnChrome());
+                  w.addJavascriptInterface(new Bridge(), "VNApp");
+                  return w;
+              }
 
-                                @Override
-                                public void onPageFinished(WebView view, String url) {
-                                    if (!loadFailed) hideOffline();
-                                    splPageReady = true; splTry();
-                                }
+              private void attachWeb() {
+                  try {
+                      if (webView.getParent() instanceof ViewGroup) ((ViewGroup) webView.getParent()).removeView(webView);
+                  } catch (Throwable ignored) { }
+                  sCtx.setBaseContext(this);
+                  root.addView(webView, new FrameLayout.LayoutParams(MP, MP));
+                  sAttached = true;
+              }
 
-                                @Override
-                                public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                                    if (request != null && request.isForMainFrame()) {
-                                        loadFailed = true;
-                                        showOffline();
-                                        splPageReady = true; splTry();
-                                    }
-                                }
-
-                      @Override
-                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                          Uri uri = request.getUrl();
-                          String host = uri.getHost();
-                          if (host != null && host.equals(SITE_HOST)) {
-                              return false;
-                          }
-                          // Baska siteler (ornegin YouTube linkleri) tarayicida acilsin
-                          try {
-                              startActivity(new Intent(Intent.ACTION_VIEW, uri));
-                          } catch (Exception ignored) { }
-                          return true;
-                      }
-                  });
-
-                  webView.setWebChromeClient(new WebChromeClient() {
-                      @Override
-                      public void onPermissionRequest(final PermissionRequest request) {
-                          runOnUiThread(() -> handleWebPermission(request));
-                      }
-
-                      @Override
-                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
-                                                       FileChooserParams params) {
-                          if (fileCallback != null) fileCallback.onReceiveValue(null);
-                          fileCallback = callback;
-
-                          // <input capture>: dogrudan kamera uygulamasini ac
-                          if (params.isCaptureEnabled() && wantsImage(params)) {
-                              if (launchCamera()) return true;
-                          }
-                          try {
-                              startActivityForResult(params.createIntent(), FILE_REQ);
-                          } catch (Exception e) {
-                              fileCallback = null;
-                              return false;
-                          }
-                          return true;
-                      }
-                  });
-
-                  webView.addJavascriptInterface(new Object() {
-                      @JavascriptInterface
-                      public void setSecure(final boolean secure) {
-                          runOnUiThread(() -> {
-                              if (secure) {
-                                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-                              } else {
-                                  getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
-                              }
-                          });
-                      }
-
-                      @JavascriptInterface
-                      public void setBarColor(final String hex) {
-                          runOnUiThread(() -> {
-                              try {
-                                  int c = Color.parseColor(hex);
-                                  themeBg = c | 0xFF000000;
-                                  prefs.edit().putInt("themeBg", themeBg).apply();
-                                  root.setBackgroundColor(themeBg);
-                                  offline.setBackgroundColor(themeBg);
-                                  if (splash != null) splash.setBackgroundColor(themeBg);
-                                  if (gate != null) gate.setBackgroundColor(themeBg);
-                                  getWindow().setStatusBarColor(c);
-                                  getWindow().setNavigationBarColor(c);
-                              } catch (Exception ignored) { }
-                          });
-                      }
-
-                                // Site, uygulamadan acildigini bu bilgiyle dogrular
-                                @JavascriptInterface
-                                public boolean isApp() { return true; }
-                                // Telefona gelen bildirimler (JSON dizisi, yeniden eskiye)
-                                @JavascriptInterface
-                                public String notifs() { return NotifService.list(getApplicationContext()); }
-                                @JavascriptInterface
-                                public void clearNotifs() { NotifService.clear(getApplicationContext()); }
-                                // Sitenin kendi ust bar yuksekligi (dp)
-                                @JavascriptInterface
-                                public int barDp() { return fsBarDp; }
-
-                                // Pil + ag durumu (JSON): {"bat":73,"chg":false,"net":"wifi|cell|eth|other|none","lvl":0-4 veya -1}
-                                @JavascriptInterface
-                                public String sys() {
-                                    try {
-                                        int bat = -1;
-                                        boolean chg = false;
-                                        Intent b = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-                                        if (b != null) {
-                                            int l = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
-                                            int sc = b.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
-                                            if (l >= 0 && sc > 0) bat = l * 100 / sc;
-                                            int st = b.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-                                            chg = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
-                                        }
-                                        String net = "none";
-                                        int lvl = -1;
-                                        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-                                        Network n = cm.getActiveNetwork();
-                                        NetworkCapabilities nc = n == null ? null : cm.getNetworkCapabilities(n);
-                                        if (nc != null) {
-                                            if (nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                                                net = "wifi";
-                                                try {
-                                                    WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-                                                    WifiInfo wi = wm == null ? null : wm.getConnectionInfo();
-                                                    if (wi != null && wi.getRssi() > -127) lvl = WifiManager.calculateSignalLevel(wi.getRssi(), 5);
-                                                } catch (Throwable ignored) { }
-                                            } else if (nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-                                                net = "cell";
-                                                if (Build.VERSION.SDK_INT >= 28) {
-                                                    try {
-                                                        TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
-                                                        SignalStrength ss = tm == null ? null : tm.getSignalStrength();
-                                                        if (ss != null) lvl = ss.getLevel();
-                                                    } catch (Throwable ignored) { }
-                                                }
-                                            } else if (nc.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
-                                                net = "eth";
-                                            } else {
-                                                net = "other";
-                                            }
-                                        }
-                                        return "{\"bat\":" + bat + ",\"chg\":" + chg + ",\"net\":\"" + net + "\",\"lvl\":" + lvl + ",\"bt\":" + btHeadset() + "}";
-                                    } catch (Throwable t) {
-                                        return "{}";
-                                    }
-                                }
-
-                                // Siteden gelen sarki bilgisi -> bildirim paneli (kapak, sure, ileri/geri)
-                                @JavascriptInterface
-                                public void media(String title, String artist, String cover, double cur, double dur,
-                                                  boolean playing, boolean hasPrev, boolean hasNext) {
-                                    if (playing) ensureNotifPerm();
-                                    // Arka plandayken sarki kendiliginden durduysa (kullanici bildirimden durdurmadiysa) yeniden baslat
-                                    if (playing) { wasPlaying = true; resumeTries = 0; }
-                                    else if (title == null || title.isEmpty() || !bg || MediaService.userPaused) wasPlaying = false;
-                                    else if (wasPlaying && resumeTries < 40
-                                            && System.currentTimeMillis() - lastResume > 1200) {
-                                        lastResume = System.currentTimeMillis();
-                                        resumeTries++;
-                                        cmd("play", 0);
-                                    }
-                                    MediaService.push(getApplicationContext(), title, artist, cover,
-                                            (long) (cur * 1000), (long) (dur * 1000), playing, hasPrev, hasNext);
-                                }
-
-                                // Fotografi galeriye (Pictures/VN) kaydeder
-                                @JavascriptInterface
-                                public boolean saveFile(String name, String mime, String b64) {
-                                    try {
-                                        return saveToGallery(name, mime, Base64.decode(b64, Base64.DEFAULT));
-                                    } catch (Throwable t) {
-                                        return false;
-                                    }
-                                }
-                            }, "VNApp");
-
-                  if (savedInstanceState != null) {
-                      webView.restoreState(savedInstanceState);
-                  } else {
-                      webView.loadUrl(SITE_URL);
+              // Activity'ye bagli olmayan istemciler: o anki activity (varsa) cur() ile bulunur
+              static class VnClient extends WebViewClient {
+                  @Override
+                  public void onPageStarted(WebView view, String url, android.graphics.Bitmap icon) {
+                      loadFailed = false;
                   }
 
-                  checkForUpdate();
-                  checkGate();
+                  @Override
+                  public void onPageFinished(WebView view, String url) {
+                      MainActivity a = cur();
+                      if (a != null) {
+                          if (!loadFailed) a.hideOffline();
+                          a.splPageReady = true; a.splTry();
+                      }
+                  }
+
+                  @Override
+                  public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                      if (request != null && request.isForMainFrame()) {
+                          loadFailed = true;
+                          MainActivity a = cur();
+                          if (a != null) {
+                              a.showOffline();
+                              a.splPageReady = true; a.splTry();
+                          }
+                      }
+                  }
+
+                  @Override
+                  public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                      Uri uri = request.getUrl();
+                      String host = uri.getHost();
+                      if (host != null && host.equals(SITE_HOST)) {
+                          return false;
+                      }
+                      // Baska siteler (ornegin YouTube linkleri) tarayicida acilsin
+                      try {
+                          Intent i = new Intent(Intent.ACTION_VIEW, uri);
+                          MainActivity a = cur();
+                          if (a != null) a.startActivity(i);
+                          else { i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); sApp.startActivity(i); }
+                      } catch (Exception ignored) { }
+                      return true;
+                  }
               }
+
+              static class VnChrome extends WebChromeClient {
+                  @Override
+                  public void onPermissionRequest(final PermissionRequest request) {
+                      final MainActivity a = cur();
+                      if (a == null) {
+                          UI.post(() -> { try { request.deny(); } catch (Throwable ignored) { } });
+                          return;
+                      }
+                      a.runOnUiThread(() -> a.handleWebPermission(request));
+                  }
+
+                  @Override
+                  public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                                   FileChooserParams params) {
+                      MainActivity a = cur();
+                      if (a == null) { callback.onReceiveValue(null); return true; }
+                      return a.showFileChooser(callback, params);
+                  }
+              }
+
+              private boolean showFileChooser(ValueCallback<Uri[]> callback, WebChromeClient.FileChooserParams params) {
+                  if (fileCallback != null) fileCallback.onReceiveValue(null);
+                  fileCallback = callback;
+
+                  // <input capture>: dogrudan kamera uygulamasini ac
+                  if (params.isCaptureEnabled() && wantsImage(params)) {
+                      if (launchCamera()) return true;
+                  }
+                  try {
+                      startActivityForResult(params.createIntent(), FILE_REQ);
+                  } catch (Exception e) {
+                      fileCallback = null;
+                      return false;
+                  }
+                  return true;
+              }
+
+              // Site <-> uygulama koprusu (window.VNApp). Activity'ye baglanmaz; gerekince cur() kullanir
+              static class Bridge {
+                  @JavascriptInterface
+                  public void setSecure(final boolean secure) {
+                      UI.post(() -> {
+                          MainActivity a = cur();
+                          if (a == null) return;
+                          if (secure) {
+                              a.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                          } else {
+                              a.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void setBarColor(final String hex) {
+                      UI.post(() -> {
+                          MainActivity a = cur();
+                          if (a != null) { a.applyBarColor(hex); return; }
+                          try {
+                              int c = Color.parseColor(hex);
+                              sApp.getSharedPreferences("vn", Context.MODE_PRIVATE).edit().putInt("themeBg", c | 0xFF000000).apply();
+                          } catch (Exception ignored) { }
+                      });
+                  }
+
+                  // Site, uygulamadan acildigini bu bilgiyle dogrular
+                  @JavascriptInterface
+                  public boolean isApp() { return true; }
+                  // Telefona gelen bildirimler (JSON dizisi, yeniden eskiye)
+                  @JavascriptInterface
+                  public String notifs() { return NotifService.list(sApp); }
+                  @JavascriptInterface
+                  public void clearNotifs() { NotifService.clear(sApp); }
+                  // Sitenin kendi ust bar yuksekligi (dp)
+                  @JavascriptInterface
+                  public int barDp() { return fsBarDp; }
+
+                  // Karsidan mesaj gelince site cagirir. Uygulama ekranda degilse yuksek oncelikli, icerigi OLMAYAN "Yeni mesaj" bildirimi gosterir.
+                  // Not: Java'da Object.notify() final oldugu icin kopru tek parametreli (icerigi yok sayilir): VNApp.notify('m')
+                  @JavascriptInterface
+                  public void notify(String ignored) { BackgroundService.notifyMessage(sApp); }
+
+                  // Pil + ag durumu (JSON): {"bat":73,"chg":false,"net":"wifi|cell|eth|other|none","lvl":0-4 veya -1}
+                  @JavascriptInterface
+                  public String sys() {
+                      try {
+                          int bat = -1;
+                          boolean chg = false;
+                          Intent b = sApp.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+                          if (b != null) {
+                              int l = b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                              int sc = b.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                              if (l >= 0 && sc > 0) bat = l * 100 / sc;
+                              int st = b.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+                              chg = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL;
+                          }
+                          String net = "none";
+                          int lvl = -1;
+                          ConnectivityManager cm = (ConnectivityManager) sApp.getSystemService(Context.CONNECTIVITY_SERVICE);
+                          Network n = cm.getActiveNetwork();
+                          NetworkCapabilities nc = n == null ? null : cm.getNetworkCapabilities(n);
+                          if (nc != null) {
+                              if (nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                                  net = "wifi";
+                                  try {
+                                      WifiManager wm = (WifiManager) sApp.getSystemService(Context.WIFI_SERVICE);
+                                      WifiInfo wi = wm == null ? null : wm.getConnectionInfo();
+                                      if (wi != null && wi.getRssi() > -127) lvl = WifiManager.calculateSignalLevel(wi.getRssi(), 5);
+                                  } catch (Throwable ignored) { }
+                              } else if (nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                                  net = "cell";
+                                  if (Build.VERSION.SDK_INT >= 28) {
+                                      try {
+                                          TelephonyManager tm = (TelephonyManager) sApp.getSystemService(Context.TELEPHONY_SERVICE);
+                                          SignalStrength ss = tm == null ? null : tm.getSignalStrength();
+                                          if (ss != null) lvl = ss.getLevel();
+                                      } catch (Throwable ignored) { }
+                                  }
+                              } else if (nc.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                                  net = "eth";
+                              } else {
+                                  net = "other";
+                              }
+                          }
+                          return "{\"bat\":" + bat + ",\"chg\":" + chg + ",\"net\":\"" + net + "\",\"lvl\":" + lvl + ",\"bt\":" + btHeadset(sApp) + "}";
+                      } catch (Throwable t) {
+                          return "{}";
+                      }
+                  }
+
+                  // Siteden gelen sarki bilgisi -> bildirim paneli (kapak, sure, ileri/geri)
+                  @JavascriptInterface
+                  public void media(String title, String artist, String cover, double cur, double dur,
+                                    boolean playing, boolean hasPrev, boolean hasNext) {
+                      MainActivity a = cur();
+                      if (playing && a != null) a.ensureNotifPerm();
+                      // Arka plandayken sarki kendiliginden durduysa (kullanici bildirimden durdurmadiysa) yeniden baslat
+                      if (playing) { wasPlaying = true; resumeTries = 0; }
+                      else if (title == null || title.isEmpty() || !bg || MediaService.userPaused) wasPlaying = false;
+                      else if (wasPlaying && resumeTries < 40
+                              && System.currentTimeMillis() - lastResume > 1200) {
+                          lastResume = System.currentTimeMillis();
+                          resumeTries++;
+                          cmd("play", 0);
+                      }
+                      MediaService.push(sApp, title, artist, cover,
+                              (long) (cur * 1000), (long) (dur * 1000), playing, hasPrev, hasNext);
+                  }
+
+                  // Fotografi galeriye (Pictures/VN) kaydeder
+                  @JavascriptInterface
+                  public boolean saveFile(String name, String mime, String b64) {
+                      try {
+                          MainActivity a = cur();
+                          if (a == null) return false;
+                          return a.saveToGallery(name, mime, Base64.decode(b64, Base64.DEFAULT));
+                      } catch (Throwable t) {
+                          return false;
+                      }
+                  }
+              }
+
+              private void applyBarColor(String hex) {
+                  try {
+                      int c = Color.parseColor(hex);
+                      themeBg = c | 0xFF000000;
+                      prefs.edit().putInt("themeBg", themeBg).apply();
+                      root.setBackgroundColor(themeBg);
+                      offline.setBackgroundColor(themeBg);
+                      if (splash != null) splash.setBackgroundColor(themeBg);
+                      if (gate != null) gate.setBackgroundColor(themeBg);
+                      if (battGate != null) battGate.setBackgroundColor(themeBg);
+                      getWindow().setStatusBarColor(c);
+                      getWindow().setNavigationBarColor(c);
+                  } catch (Exception ignored) { }
+              }
+
+              // Bildirime basilinca uygulama acilir ve odak mesaj kutusuna gelir
+              private void handleOpenIntent(Intent i) {
+                  if (i == null || !BackgroundService.A_OPEN.equals(i.getAction())) return;
+                  i.setAction(Intent.ACTION_MAIN); // tekrar tetiklenmesin
+                  BackgroundService.cancelMsg(this);
+                  fgH.postDelayed(this::focusInput, 450);
+              }
+
+              private void focusInput() {
+                  try {
+                      if (webView == null || isFinishing()) return;
+                      webView.requestFocus();
+                      webView.evaluateJavascript("(window.vnFocusInput&&window.vnFocusInput())===true", v -> {
+                          if (!"true".equals(v)) return;
+                          try {
+                              InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                              if (imm != null && webView != null) imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT);
+                          } catch (Throwable ignored) { }
+                      });
+                  } catch (Throwable ignored) { }
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  handleOpenIntent(intent);
+              }
+
+              // ===================== PIL OPTIMIZASYONU MUAFIYETI ZORUNLU =====================
+              // Muafiyet verilmeden site kullanilamaz; kapatilamayan ekran. Donuste (onResume) tekrar kontrol edilir, verilince kendiliginden kapanir.
+              private LinearLayout battGate;
+              private final Runnable battPoll = new Runnable() {
+                  @Override public void run() { checkBattGate(); }
+              };
+
+              private boolean battExempt() {
+                  if (Build.VERSION.SDK_INT < 23) return true;
+                  try {
+                      PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                      return pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              private void buildBattGate() {
+                  battGate = new LinearLayout(this);
+                  battGate.setOrientation(LinearLayout.VERTICAL);
+                  battGate.setGravity(Gravity.CENTER);
+                  battGate.setPadding(dp(32), dp(32), dp(32), dp(32));
+                  battGate.setBackgroundColor(themeBg);
+                  battGate.setClickable(true);
+                  battGate.setVisibility(View.GONE);
+                  battGate.addView(label("Pil optimizasyonu muafiyeti gerekli", 22, 0xFFFFFFFF, true), lp(MP, WC, 0));
+                  battGate.addView(label("Mesajların arka planda da gelebilmesi için VN'nin pil optimizasyonundan muaf tutulması gerekiyor. Açılan pencerede \"İzin ver\"e bas.", 14, 0xFF9B9B9B, false), lp(MP, WC, 12));
+                  battGate.addView(button("İzin ver", true, v -> requestBattExempt()), lp(dp(200), dp(50), 28));
+                  battGate.addView(label("Pencere açılmazsa ya da reddedersen pil ayarlarından VN'yi \"Kısıtlama yok\" / \"Optimize etme\" olarak seç.", 12, 0xFF9B9B9B, false), lp(MP, WC, 24));
+                  battGate.addView(button("Pil ayarlarını aç", false, v -> openBattSettings()), lp(dp(200), dp(44), 6));
+                  root.addView(battGate, new FrameLayout.LayoutParams(MP, MP));
+              }
+
+              private void checkBattGate() {
+                  if (battGate == null) return;
+                  boolean ok = battExempt();
+                  battGate.setVisibility(ok ? View.GONE : View.VISIBLE);
+                  fgH.removeCallbacks(battPoll);
+                  if (!ok) fgH.postDelayed(battPoll, 1500); // ayar ekranindan donunce / bolunmus ekranda da kendiliginden kapansin
+              }
+
+              private void requestBattExempt() {
+                  try {
+                      startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+                  } catch (Throwable e) {
+                      openBattSettings();
+                  }
+              }
+
+              // Yedek: pencere acilmazsa / reddedilirse pil ayarlarina gotur
+              private void openBattSettings() {
+                  try {
+                      startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                      return;
+                  } catch (Throwable ignored) { }
+                  try {
+                      startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+                  } catch (Throwable ignored) { }
+              }
+              // =================== PIL OPTIMIZASYONU MUAFIYETI SONU ===================
 
               // ===================== BILDIRIM ERISIMI ZORUNLU =====================
               // Bildirim erisimi (NotificationListener) izni verilmeden uygulama acilmaz
               private LinearLayout gate;
-              
+
               private boolean notifAccessOn() {
                   try {
                       return androidx.core.app.NotificationManagerCompat.getEnabledListenerPackages(this).contains(getPackageName());
@@ -637,7 +855,7 @@ jobs:
                       return false;
                   }
               }
-              
+
               private void buildGate() {
                   gate = new LinearLayout(this);
                   gate.setOrientation(LinearLayout.VERTICAL);
@@ -653,7 +871,7 @@ jobs:
                   gate.addView(button("Uygulama bilgisi", false, v -> openAppInfo()), lp(dp(200), dp(44), 6));
                   root.addView(gate, new FrameLayout.LayoutParams(MP, MP));
               }
-              
+
               private void checkGate() {
                   if (gate == null) return;
                   boolean ok = notifAccessOn();
@@ -665,7 +883,7 @@ jobs:
                       } catch (Throwable ignored) { }
                   }
               }
-              
+
               private void openNotifSettings() {
                   try {
                       Intent i;
@@ -681,14 +899,14 @@ jobs:
                       try { startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)); } catch (Exception ignored) { }
                   }
               }
-              
+
               private void openAppInfo() {
                   try {
                       startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
                   } catch (Exception ignored) { }
               }
               // =================== BILDIRIM ERISIMI SONU ===================
-              
+
               private void ensureNotifPerm() {
                   if (Build.VERSION.SDK_INT >= 33 && !askedNotif
                           && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
@@ -947,9 +1165,9 @@ jobs:
               }
 
               // Bluetooth kulaklik (A2DP / SCO / BLE) bagli mi?
-              private boolean btHeadset() {
+              static boolean btHeadset(Context c) {
                   try {
-                      android.media.AudioManager am = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                      android.media.AudioManager am = (android.media.AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
                       if (am == null) return false;
                       for (android.media.AudioDeviceInfo d : am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)) {
                           int t = d.getType();
@@ -1458,6 +1676,7 @@ jobs:
                   super.onResume();
                   applyFullscreen();
                   checkGate();
+                  checkBattGate();
                   if (!permsAsked) { permsAsked = true; askAllPerms(); }
                   enforceNearby();
                   if (pendingApk != null && Build.VERSION.SDK_INT >= 26 && getPackageManager().canRequestPackageInstalls()) {
@@ -1470,7 +1689,7 @@ jobs:
 
               // Muzik caliyorsa ekran kapaninca / arka planda WebView durmasin
               private void keepAlive() {
-                  if (MediaService.playing && webView != null) {
+                  if ((MediaService.playing || BackgroundService.running) && webView != null) {
                       webView.onResume();
                       webView.resumeTimers();
                   }
@@ -1479,7 +1698,6 @@ jobs:
               // ===================== TAM EKRAN (kendi ust bar) =====================
               // true yapilirsa alttaki gezinme cubugu da gizlenir (kaydirinca gecici gorunur)
               private static final boolean HIDE_NAV_BAR = false;
-              private volatile int fsBarDp = 0;
 
               // Icerigi ekranin en ustune (cent alani dahil) kadar uzatir. Ust bosluk 0: sitenin kendi ust bari orayi kaplar.
               // Alt: gezinme cubugu veya klavye (hangisi buyukse). Yanlar: cubuk / cent.
@@ -1529,13 +1747,12 @@ jobs:
               @Override
               public void onWindowFocusChanged(boolean hasFocus) {
                   super.onWindowFocusChanged(hasFocus);
-                  if (hasFocus) applyFullscreen(); // klavye / bildirim cekmecesi sonrasi barlar yeniden gizlensin
+                  if (hasFocus) { applyFullscreen(); checkBattGate(); } // klavye / bildirim cekmecesi sonrasi barlar yeniden gizlensin
               }
 
               // ===================== ARKA PLANA GIDINCE GIZLE (3828 PIN'i) =====================
               // Galeri / kamera / harici uygulama acarken (geri donulecek) gizleme yapma
               private boolean suppressHide = false;
-              private boolean hideOnReturn = false;
               private boolean stoppedNow = false;
               private final Handler fgH = new Handler(Looper.getMainLooper());
 
@@ -1557,6 +1774,7 @@ jobs:
                   bg = false;
                   stoppedNow = false;
                   suppressHide = false;
+                  BackgroundService.cancelMsg(this);
                   startUpdateWatch();
                   if (hideOnReturn) {
                       hideOnReturn = false;
@@ -1585,15 +1803,21 @@ jobs:
                           ((ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE)).unregisterNetworkCallback(netCb);
                       } catch (Exception ignored) { }
                   }
+                  fgH.removeCallbacks(battPoll);
                   if (isFinishing()) {
+                      // Uygulama kapatildi: calan sarkiyi eskisi gibi durdur. WebView ve PeerJS ise YASAMAYA DEVAM eder.
+                      if (MediaService.playing) { MediaService.userPaused = true; wasPlaying = false; cmd("pause", 0); }
                       MediaService.stop(this);
-                      if (inst != null && inst.get() == this) inst = null;
-                      try {
-                          try { webView.clearCache(true); webView.clearHistory(); webView.clearFormData(); } catch (Throwable ignored) { }
-                          root.removeView(webView);
-                          webView.destroy();
-                      } catch (Exception ignored) { }
                   }
+                  // WebView'i yok etme: bu activity'den ayir, baglami uygulama baglamina geri ver
+                  try {
+                      if (webView != null && webView.getParent() == root) {
+                          root.removeView(webView);
+                          sAttached = false;
+                      }
+                      if (sCtx != null && sCtx.getBaseContext() == this) sCtx.setBaseContext(sApp);
+                  } catch (Throwable ignored) { }
+                  if (inst != null && inst.get() == this) inst = null;
                   super.onDestroy();
               }
 
@@ -1617,6 +1841,17 @@ jobs:
                   android:pathData="M12,3v10.55c-0.59,-0.34 -1.27,-0.55 -2,-0.55 -2.21,0 -4,1.79 -4,4s1.79,4 4,4 4,-1.79 4,-4V7h4V3h-6z" />
           </vector>
           EOF_20
+          cat > app/src/main/res/drawable/ic_msg.xml <<'EOF_20B'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="#FFFFFFFF"
+                  android:pathData="M20,2H4c-1.1,0 -2,0.9 -2,2v18l4,-4h14c1.1,0 2,-0.9 2,-2V4c0,-1.1 -0.9,-2 -2,-2z" />
+          </vector>
+          EOF_20B
           cat > app/src/main/java/com/vn/app/MediaService.java <<'EOF_21'
           package com.vn.app;
 
@@ -2044,6 +2279,193 @@ jobs:
               }
           }
           EOF_22
+          cat > app/src/main/java/com/vn/app/BackgroundService.java <<'EOF_23'
+          package com.vn.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.PowerManager;
+
+          // Sarkidan bagimsiz, surekli calisan on plan servisi (tur: remoteMessaging).
+          // - Kalici bildirimle process'i ve WebView'deki PeerJS baglantisini canli tutar
+          // - Arka planda WebView zamanlayicilari donmasin diye poke/keepAlive mantigini surekli calistirir
+          // - Karsidan mesaj gelince icerigi olmayan, yuksek oncelikli "Yeni mesaj" bildirimini gosterir (hicbir sey kaydedilmez)
+          public class BackgroundService extends Service {
+
+              static final String CH_BG = "vn_bg";
+              static final String CH_MSG = "vn_msg";
+              static final int NID_BG = 72;
+              static final int NID_MSG = 73;
+              static final String A_OPEN = "com.vn.app.OPEN_CHAT";
+
+              static volatile boolean running = false;
+
+              private PowerManager.WakeLock wl;
+              private android.net.wifi.WifiManager.WifiLock wfl;
+              private final Handler main = new Handler(Looper.getMainLooper());
+              private final Runnable tick = new Runnable() {
+                  @Override public void run() {
+                      if (!running) return;
+                      MainActivity.poke();
+                      MainActivity.serviceRetry();
+                      grab();
+                      main.postDelayed(this, 7000);
+                  }
+              };
+
+              // Uygulama acilinca baslatilir
+              static void start(Context c) {
+                  try {
+                      Intent i = new Intent(c, BackgroundService.class);
+                      if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(i);
+                      else c.startService(i);
+                  } catch (Throwable ignored) { }
+              }
+
+              private static void ensureChannels(NotificationManager nm) {
+                  if (Build.VERSION.SDK_INT < 26 || nm == null) return;
+                  NotificationChannel bg = new NotificationChannel(CH_BG, "Arka plan ba\u011flant\u0131s\u0131", NotificationManager.IMPORTANCE_LOW);
+                  bg.setShowBadge(false);
+                  bg.setSound(null, null);
+                  nm.createNotificationChannel(bg);
+                  NotificationChannel msg = new NotificationChannel(CH_MSG, "Yeni", NotificationManager.IMPORTANCE_HIGH);
+                  msg.setShowBadge(true);
+                  msg.enableVibration(true);
+                  nm.createNotificationChannel(msg);
+              }
+
+              // Karsidan mesaj geldi (VNApp.notify). Yalnizca uygulama ekranda degilken gosterilir.
+              // Bildirimde sadece "Yeni mesaj" yazar: mesaj icerigi, isim ya da baska hicbir sey yoktur ve hicbir yere kaydedilmez.
+              static void notifyMessage(Context c) {
+                  try {
+                      PowerManager pm = (PowerManager) c.getSystemService(Context.POWER_SERVICE);
+                      boolean interactive = pm == null || pm.isInteractive();
+                      if (!MainActivity.bg && interactive) return; // uygulama ekranda: bildirim yok
+
+                      NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+                      ensureChannels(nm);
+
+                      Intent open = new Intent(c, MainActivity.class).setAction(A_OPEN);
+                      open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                      PendingIntent pi = PendingIntent.getActivity(c, NID_MSG, open,
+                              PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+
+                      Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                              ? new Notification.Builder(c, CH_MSG) : new Notification.Builder(c);
+                      b.setSmallIcon(R.drawable.ic_msg)
+                              .setContentTitle("Yeni")
+                              .setContentIntent(pi)
+                              .setAutoCancel(true)
+                              .setOnlyAlertOnce(false)
+                              .setCategory(Notification.CATEGORY_MESSAGE)
+                              .setVisibility(Notification.VISIBILITY_PUBLIC);
+                      if (Build.VERSION.SDK_INT < 26) {
+                          b.setPriority(Notification.PRIORITY_HIGH);
+                          b.setDefaults(Notification.DEFAULT_ALL);
+                      }
+                      nm.notify(NID_MSG, b.build());
+                  } catch (Throwable ignored) { }
+              }
+
+              static void cancelMsg(Context c) {
+                  try {
+                      ((NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE)).cancel(NID_MSG);
+                  } catch (Throwable ignored) { }
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) {
+                  return null;
+              }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  running = true;
+                  NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                  ensureChannels(nm);
+                  PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                  wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vn:bg");
+                  wl.setReferenceCounted(false);
+                  try {
+                      android.net.wifi.WifiManager wm = (android.net.wifi.WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                      if (wm != null) { wfl = wm.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "vn:bg"); wfl.setReferenceCounted(false); }
+                  } catch (Exception ignored) { }
+                  goForeground();
+                  main.removeCallbacks(tick);
+                  main.postDelayed(tick, 7000);
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  goForeground(); // startForegroundService() her cagrisinda 5 sn icinde startForeground sart
+                  grab();
+                  // Sistem process'i oldurup servisi yeniden baslatirsa (intent == null) activity yok: siteyi arka planda yukle
+                  if (intent == null) {
+                      try { MainActivity.ensureWebForService(getApplicationContext()); } catch (Throwable ignored) { }
+                  }
+                  return START_STICKY;
+              }
+
+              private void goForeground() {
+                  Notification n = buildOngoing();
+                  try {
+                      if (Build.VERSION.SDK_INT >= 34) {
+                          startForeground(NID_BG, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
+                      } else {
+                          startForeground(NID_BG, n);
+                      }
+                  } catch (Throwable ignored) { }
+              }
+
+              private Notification buildOngoing() {
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(this, CH_BG) : new Notification.Builder(this);
+                  Intent open = new Intent(this, MainActivity.class);
+                  open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(this, NID_BG, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+                  b.setSmallIcon(R.drawable.ic_msg)
+                          .setContentTitle("VN")
+                          .setContentText("Ba\u011flant\u0131 arka planda a\u00e7\u0131k")
+                          .setContentIntent(pi)
+                          .setOngoing(true)
+                          .setOnlyAlertOnce(true)
+                          .setShowWhen(false)
+                          .setCategory(Notification.CATEGORY_SERVICE)
+                          .setVisibility(Notification.VISIBILITY_SECRET);
+                  if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_LOW);
+                  return b.build();
+              }
+
+              // Ekran kapaliyken de CPU ve Wi-Fi uyumasin (PeerJS soketi / zamanlayicilar canli kalsin)
+              private void grab() {
+                  try {
+                      if (wl != null && !wl.isHeld()) wl.acquire(10 * 60 * 1000L);
+                      if (wfl != null && !wfl.isHeld()) wfl.acquire();
+                  } catch (Exception ignored) { }
+              }
+
+              @Override
+              public void onDestroy() {
+                  running = false;
+                  main.removeCallbacks(tick);
+                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception ignored) { }
+                  try { if (wfl != null && wfl.isHeld()) wfl.release(); } catch (Exception ignored) { }
+                  super.onDestroy();
+              }
+          }
+          EOF_23
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           echo "iVBORw0KGgoAAAANSUhEUgAAAJAAAACQBAMAAAAVaP+LAAAAGFBMVEX////+/v78/Pz39/e7u7s9PT0CAgIAAABo/BndAAAD1ElEQVR42u2YvXbbNhiGn0/x1lj4qKRT0kiKrSmD4/6sPnb3OlOvoLfX40uIT3IBcpXOlgR3jUSAbjeb6EBLoiQqRs/p6VK8E0lAD1+8xAcSgqSkpKSkpKSkpKSkpKT/XP3+o12kdtzqAWFSb+0DjPsT6U43L8/dTtC2tOrcG7SHk3/g6LAHhMty1fjkFOB965f2r2G6cflulNdBe7XbH7wFyny4ujL4Dgiz340//q3W8YdjYPaJHSBCDki7t7y36edAEBwHl7rMxEi+GvYy4NVhcamSZaGz7NC6NZJlakZoVpx1aneULNvg1EEYB+jrYnnBq4KbGMAcoOvB6k5Q+dQDSG/RxXzrAJkpQHHU0S89tbojlwMUr5agTCAE7wAxh9NokL80dc9yawDMqEqjeCexIIxziHluq7OO7ym4eQUWc+h7kaDw0gNki8yOHSDX3QeDxYnEOnI5IP60urPpVBEtisMMbC8SZC8NIKY6W48IpDiXSJAEcgjPfT0isxr6wGdxoPIbC2jmq0WoNosAyIoTjQNV1YY/6QHtPhCCDbXmgd1paW/tzP71FkRUAckEMKPVqkLmzm/yKEeSOyA8syB/GAWXm7WJNhhpFKjc9w604yETBeTzGojip0xjQNUCgD9S2mceQvDrjs3ARjnCjw2IGH2Y4ObDatmpSvp8xyKwCZoAhAPf+vMhIrf2JhAzsFGg0kwdkHn8VkQ+VClJDIh9D2hx1D1zEEJtPXXX6kDCDkuboJt5FZKpZtHHGunOAmhxEuVIrgDCs6pic2oguTA5SPh+FAOqQtL+jSr4z6/q9fPGAmS372JAVUj4rYiA1oU6IBw+XmsQbr7ugnQ6AOZjWW/LX1gDqO9qhCOudLkMbBRouL1QQIzGDC0Y50AywG8UGvOvbA7gokD7y2oKLmy0VSlJFgPC52Hh7dPmrd0LG+KKFvBDXbxTtoZQFhfqYkFVSIDMu1uN7o2NdrQKab49jNJeGBcJWoQU2n663ehe2lhHSBWSC001FRg2W2oA5Q8hjbtNP5jeNT+4BlCoyk3mpukHQd6riwMhkwChbaeNYUzuGy01gYqq3Gzz4wkMNRI0bzuHn5gdM8Zd2zwOVIU02wUqzVDjQPhJCKV3u74X/MxuV08z6EprH1jblsJY4xzRdutfDw6oPSo3tnGg8t7LdR2keZ7X3ovhfryo7EcctcZlUeuoPsvWvkL82G5uIfYaQfnw6dVqKOXdNcCHUHuu4x9nUZtYRb+8X3zy86nGbEVF1+bca4Dx2nZ5Isb9G/tuyTT9+ZCUlJSUlJSUlJT0/9PfV9CUZwkEE4cAAAAASUVORK5CYII=" | base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
           echo "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" | base64 -d > vn.keystore
