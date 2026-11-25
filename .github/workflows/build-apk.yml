@@ -531,6 +531,19 @@ jobs:
                                 // Site, uygulamadan acildigini bu bilgiyle dogrular
                                 @JavascriptInterface
                                 public boolean isApp() { return true; }
+                                // Ses baloncugunu surukleyince sesi ayarlar (medya sesi, sistem paneli cikmaz)
+                                @JavascriptInterface
+                                public void setVol(final int level) {
+                                    runOnUiThread(() -> {
+                                        try {
+                                            android.media.AudioManager am = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                                            if (am == null) return;
+                                            int mx = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC);
+                                            am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, Math.max(0, Math.min(mx, level)), 0);
+                                            pushVol();
+                                        } catch (Throwable ignored) { }
+                                    });
+                                }
                                 // Panodaki en son kopyalanan metin (sarki listesi yapistirma icin)
                                 @JavascriptInterface
                                 public String clip() {
@@ -1574,6 +1587,79 @@ jobs:
                   super.startActivityForResult(intent, requestCode, options);
               }
 
+              // Telefon ses seviyesi degisince siteye haber verir (ses baloncugu)
+              private android.content.BroadcastReceiver volRx;
+
+              private boolean headphonesOn() {
+                  try {
+                      android.media.AudioManager am = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                      if (am == null) return false;
+                      for (android.media.AudioDeviceInfo d : am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)) {
+                          int t = d.getType();
+                          if (t == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES || t == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET
+                                  || t == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+                                  || t == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || t == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO) return true;
+                          if (Build.VERSION.SDK_INT >= 31 && t == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET) return true;
+                      }
+                  } catch (Throwable ignored) { }
+                  return false;
+              }
+
+              private void pushVol() {
+                  try {
+                      android.media.AudioManager am = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                      if (am == null) return;
+                      int v = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC);
+                      int mx = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC);
+                      evalJs("window.vnVol&&window.vnVol(" + v + "," + mx + "," + (headphonesOn() ? 1 : 0) + ")");
+                  } catch (Throwable ignored) { }
+              }
+
+              private void startVolWatch() {
+                  if (volRx != null) return;
+                  try {
+                      volRx = new android.content.BroadcastReceiver() {
+                          @Override
+                          public void onReceive(Context c, Intent i) {
+                              try {
+                                  if (i != null && "android.media.VOLUME_CHANGED_ACTION".equals(i.getAction())
+                                          && i.getIntExtra("android.media.EXTRA_VOLUME_STREAM_TYPE", -1) == android.media.AudioManager.STREAM_MUSIC) pushVol();
+                              } catch (Throwable ignored) { }
+                          }
+                      };
+                      IntentFilter f = new IntentFilter("android.media.VOLUME_CHANGED_ACTION");
+                      if (Build.VERSION.SDK_INT >= 33) registerReceiver(volRx, f, Context.RECEIVER_EXPORTED);
+                      else registerReceiver(volRx, f);
+                  } catch (Throwable t) { volRx = null; }
+              }
+
+              private void stopVolWatch() {
+                  if (volRx == null) return;
+                  try { unregisterReceiver(volRx); } catch (Throwable ignored) { }
+                  volRx = null;
+              }
+
+              // Ses tuslarini uygulama yakalar: telefonun kendi ses paneli cikmaz, sadece sitedeki baloncuk gorunur
+              @Override
+              public boolean dispatchKeyEvent(android.view.KeyEvent e) {
+                  int kc = e.getKeyCode();
+                  if (kc == android.view.KeyEvent.KEYCODE_VOLUME_UP || kc == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) {
+                      try {
+                          android.media.AudioManager am = (android.media.AudioManager) getSystemService(Context.AUDIO_SERVICE);
+                          // Gercek arama / iletisim modunda sistem kendi halletsin
+                          if (am != null && am.getMode() == android.media.AudioManager.MODE_NORMAL) {
+                              if (e.getAction() == android.view.KeyEvent.ACTION_DOWN) {
+                                  am.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC,
+                                          kc == android.view.KeyEvent.KEYCODE_VOLUME_UP ? android.media.AudioManager.ADJUST_RAISE : android.media.AudioManager.ADJUST_LOWER, 0);
+                                  pushVol();
+                              }
+                              return true;
+                          }
+                      } catch (Throwable ignored) { }
+                  }
+                  return super.dispatchKeyEvent(e);
+              }
+
               private void evalJs(String js) {
                   try { if (webView != null) webView.evaluateJavascript(js, null); } catch (Throwable ignored) { }
               }
@@ -1585,6 +1671,7 @@ jobs:
                   stoppedNow = false;
                   suppressHide = false;
                   startUpdateWatch();
+                  startVolWatch();
                   if (hideOnReturn) {
                       hideOnReturn = false;
                       // Site (yalnizca 3828 ile girildiyse) ekrani gizler ve donuste PIN sorar
@@ -1598,6 +1685,7 @@ jobs:
                   bg = true;
                   stoppedNow = true;
                   stopUpdateWatch();
+                  stopVolWatch();
                   keepAlive();
                   if (!suppressHide) {
                       hideOnReturn = true;
