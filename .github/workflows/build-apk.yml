@@ -1089,6 +1089,17 @@ jobs:
                   super.onActivityResult(requestCode, resultCode, data);
               }
 
+              // Bildirime basilinca (uygulama arkadayken de) calan sarkiyi buyuk kapakli gorunumde ac
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  if (intent != null && intent.getBooleanExtra("vn_np", false)) {
+                      intent.removeExtra("vn_np");
+                      evalJs("window.vnOpenNp&&window.vnOpenNp()");
+                  }
+              }
+
               @Override
               protected void onSaveInstanceState(Bundle outState) {
                   super.onSaveInstanceState(outState);
@@ -1762,6 +1773,7 @@ jobs:
                       @Override public void onStop() { send("pause", 0); }
                   });
                   session.setActive(true);
+                  session.setSessionActivity(openNpIntent());
                   PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                   wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vn:media");
                   wl.setReferenceCounted(false);
@@ -1877,14 +1889,20 @@ jobs:
                   return new Notification.Action.Builder(Icon.createWithResource(this, icon), title, pi).build();
               }
 
+              // Bildirim / medya paneli tiklamasi: uygulamayi one getirir ve buyuk "Simdi caliyor" gorunumunu actirir
+              private PendingIntent openNpIntent() {
+                  Intent open = new Intent(this, MainActivity.class);
+                  open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  open.putExtra("vn_np", true);
+                  return PendingIntent.getActivity(this, 0, open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+              }
+
               private Notification buildNotification(boolean pl) {
                   Notification.Builder b = Build.VERSION.SDK_INT >= 26
                           ? new Notification.Builder(this, CH) : new Notification.Builder(this);
 
-                  Intent open = new Intent(this, MainActivity.class);
-                  open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                  PendingIntent content = PendingIntent.getActivity(this, 0, open,
-                          PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
+                  PendingIntent content = openNpIntent();
 
                   b.setSmallIcon(R.drawable.ic_stat)
                           .setContentTitle(sTitle)
